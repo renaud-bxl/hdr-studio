@@ -7,7 +7,7 @@ glisser-deposer, traitement en lot.
 ## Installation (terminal)
 
 ```bash
-git clone https://github.com/renaud-bxl/hdr-studio.git
+git clone https://github.com/renaud-bxl/hdr-studio.git -b claude
 cd hdr-studio
 ./install.sh
 ```

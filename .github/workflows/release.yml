@@ -15,7 +15,7 @@ jobs:
       - name: Paquet DMG
         run: |
           mkdir -p stage
-          cp -R "HDR Studio.app" stage/
+          cp -R "HDR Studio Claude.app" stage/
           ln -s /Applications stage/Applications
           hdiutil create -volname "HDR Studio" -srcfolder stage -ov -format UDZO HDRStudio.dmg
       # --- Notarisation (a activer avec vos secrets Apple Developer) ---
@@ -25,7 +25,7 @@ jobs:
       #     AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
       #     TEAM_ID: ${{ secrets.TEAM_ID }}
       #   run: |
-      #     codesign --force --deep --options runtime --sign "Developer ID Application: $TEAM_ID" "HDR Studio.app"
+      #     codesign --force --deep --options runtime --sign "Developer ID Application: $TEAM_ID" "HDR Studio Claude.app"
       #     xcrun notarytool submit HDRStudio.dmg --apple-id "$AC_USERNAME" --password "$AC_PASSWORD" --team-id "$TEAM_ID" --wait
       #     xcrun stapler staple HDRStudio.dmg
       - uses: actions/upload-artifact@v4
