@@ -1,0 +1,311 @@
+import CoreGraphics
+import Dispatch
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+
+private struct PhotoError: LocalizedError {
+    let errorDescription: String?
+
+    init(_ message: String) { errorDescription = message }
+}
+
+private func executable(_ name: String) -> URL? {
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+    let folders = path.split(separator: ":").map(String.init) + ["/opt/homebrew/bin", "/usr/local/bin"]
+    return folders.lazy.map { URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent(name) }
+        .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+}
+
+private final class PhotoCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let signalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
+    private var child: Process?
+    private var scratch: URL?
+
+    init() {
+        signal(SIGTERM, SIG_IGN)
+        signalSource.setEventHandler { [weak self] in self?.stop() }
+        signalSource.resume()
+    }
+
+    func prepare(_ directory: URL) throws {
+        try lock.withLock {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            scratch = directory
+        }
+    }
+
+    func launch(_ process: Process) throws {
+        try lock.withLock {
+            try process.run()
+            child = process
+        }
+    }
+
+    func clearChild() {
+        lock.withLock { child = nil }
+    }
+
+    func clean() {
+        lock.withLock {
+            if let scratch { try? FileManager.default.removeItem(at: scratch) }
+            scratch = nil
+        }
+    }
+
+    private func stop() {
+        lock.withLock {
+            // Stop the standalone HEIF utility even if it inherited ignored SIGTERM.
+            if let child, child.isRunning { _ = kill(child.processIdentifier, SIGKILL) }
+            if let scratch { try? FileManager.default.removeItem(at: scratch) }
+        }
+        exit(128 + SIGTERM)
+    }
+}
+
+private let cancellation = PhotoCancellation()
+
+private func run(_ executable: URL, _ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = arguments
+    let messages = Pipe()
+    process.standardOutput = messages
+    process.standardError = messages
+    try cancellation.launch(process)
+    defer { cancellation.clearChild() }
+    let data = messages.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        let detail = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        throw PhotoError("Échec de \(executable.lastPathComponent) : \(detail.suffix(600))")
+    }
+}
+
+private struct LinearImage {
+    let buffer: CGContext
+    let width: Int
+    let height: Int
+    let orientation: Int
+    let isHDR: Bool
+
+    var outputWidth: Int { orientation >= 5 ? height : width }
+    var outputHeight: Int { orientation >= 5 ? width : height }
+
+    func pixelOffset(x: Int, y: Int) -> Int {
+        let origin: (Int, Int)
+        switch orientation {
+        case 2: origin = (width - 1 - x, y)
+        case 3: origin = (width - 1 - x, height - 1 - y)
+        case 4: origin = (x, height - 1 - y)
+        case 5: origin = (y, x)
+        case 6: origin = (y, height - 1 - x)
+        case 7: origin = (width - 1 - y, height - 1 - x)
+        case 8: origin = (width - 1 - y, x)
+        default: origin = (x, y)
+        }
+        return 4 * (origin.1 * width + origin.0)
+    }
+}
+
+private func isHEIF(_ source: CGImageSource) -> Bool {
+    guard let typeID = CGImageSourceGetType(source) as String?, let type = UTType(typeID) else { return false }
+    return type.conforms(to: .heic) || type.conforms(to: .heif) || typeID == "public.avif"
+}
+
+@available(macOS 14.0, *)
+private func decode(_ source: CGImageSource, linearSpace: CGColorSpace) throws -> LinearImage? {
+    let index = CGImageSourceGetPrimaryImageIndex(source)
+    let metadata = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] ?? [:]
+    let rawOrientation = (metadata[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+    let orientation = (1...8).contains(rawOrientation) ? rawOrientation : 1
+    let request = [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
+                   kCGImageSourceShouldCacheImmediately: kCFBooleanTrue as Any] as CFDictionary
+    guard let image = CGImageSourceCreateImageAtIndex(source, index, request) else { return nil }
+    let width = image.width
+    let height = image.height
+    // Protect the two full-size processing buffers from excessive allocations.
+    guard width > 0, height > 0, width <= 80_000_000 / height else {
+        throw PhotoError("Cette photo dépasse la limite de 80 mégapixels.")
+    }
+    let format = CGBitmapInfo.byteOrder32Little.union(.floatComponents).rawValue
+        | CGImageAlphaInfo.premultipliedLast.rawValue
+    guard let canvas = CGContext(data: nil, width: width, height: height, bitsPerComponent: 32,
+                                bytesPerRow: width * 16, space: linearSpace, bitmapInfo: format),
+          let storage = canvas.data else {
+        throw PhotoError("La mémoire disponible ne permet pas de traiter cette photo.")
+    }
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+    canvas.clear(bounds)
+    canvas.setBlendMode(.copy)
+    if #available(macOS 15.0, *) {
+        // Keep the decoded HDR values; 0 asks Core Graphics not to tone map them.
+        _ = canvas.setEDRTargetHeadroom(0)
+    }
+    canvas.draw(image, in: bounds)
+    var hasHDR = image.colorSpace.map { CGColorSpaceUsesITUR_2100TF($0) } ?? false
+    if #available(macOS 15.0, *) {
+        hasHDR = hasHDR || image.contentHeadroom > 1.0
+    }
+    hasHDR = hasHDR || CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil
+
+    if isHEIF(source) {
+        // On systems without VideoToolbox decoding, ImageIO can silently draw an
+        // empty raster from a valid HEIC header. Fully transparent inputs can
+        // also take this branch and still get flattened to black in software.
+        let rgba = storage.assumingMemoryBound(to: Float.self)
+        guard stride(from: 3, to: width * height * 4, by: 4).contains(where: { rgba[$0] > 0 }) else {
+            return nil
+        }
+    }
+    return LinearImage(buffer: canvas, width: width, height: height, orientation: orientation, isHDR: hasHDR)
+}
+
+// SMPTE ST 2084. A square-root luminance index retains precision in dark tones.
+private let pqTable: [Float] = (0...16_384).map { index in
+    let position = Double(index) / 16_384
+    let power = pow(position * position, 2610.0 / 16_384.0)
+    let value = pow((3424.0 / 4096.0 + (2413.0 / 128.0) * power)
+                    / (1.0 + (2392.0 / 128.0) * power), 2523.0 / 32.0)
+    return Float(value * 65_535)
+}
+
+private func encodePQ(_ linear: Float) -> UInt16 {
+    // Extended linear BT.2020 1.0 is the 203 cd/m² HDR reference white.
+    let scaled = sqrt(min(1, max(0, linear * 0.0203))) * 16_384
+    let index = min(16_383, Int(scaled))
+    let value = pqTable[index] + (pqTable[index + 1] - pqTable[index]) * (scaled - Float(index))
+    return UInt16(clamping: Int(value.rounded()))
+}
+
+private func render(_ image: LinearImage, strength: Float, pqSpace: CGColorSpace) throws -> CGImage {
+    let width = image.outputWidth
+    let height = image.outputHeight
+    guard let storage = image.buffer.data else { throw PhotoError("La photo n’a pas pu être rendue.") }
+    let input = storage.assumingMemoryBound(to: Float.self)
+    var output = Data(count: width * height * 8)
+    let liftStrength: Float = image.isHDR ? 0.0 : strength * 3.9
+    output.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+        let pixels = raw.bindMemory(to: UInt16.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let source = image.pixelOffset(x: x, y: y)
+                let r = max(0, input[source])
+                let g = max(0, input[source + 1])
+                let b = max(0, input[source + 2])
+                // Alpha is already premultiplied: transparent content is composited onto black.
+                // Lift only the highlights and scale the channels together to preserve hue.
+                let luma = 0.2627 * r + 0.6780 * g + 0.0593 * b
+                let t = min(1, max(0, (luma - 0.32) / 0.68))
+                let gain = 1 + liftStrength * t * t * (3 - 2 * t)
+                let target = 4 * (y * width + x)
+                pixels[target] = encodePQ(r * gain)
+                pixels[target + 1] = encodePQ(g * gain)
+                pixels[target + 2] = encodePQ(b * gain)
+                pixels[target + 3] = 65_535
+            }
+        }
+    }
+    let info = CGBitmapInfo.byteOrder16Little.union(CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue))
+    guard let provider = CGDataProvider(data: output as CFData),
+          let result = CGImage(width: width, height: height, bitsPerComponent: 16, bitsPerPixel: 64,
+                               bytesPerRow: width * 8, space: pqSpace, bitmapInfo: info, provider: provider,
+                               decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+        throw PhotoError("Impossible de créer l’image HDR.")
+    }
+    return result
+}
+
+@available(macOS 14.0, *)
+private func exportPhoto(input: URL, output: URL, strength: Float) throws {
+    let files = FileManager.default
+    guard output.pathExtension.lowercased() == "heic" else {
+        throw PhotoError("Le nom du fichier de sortie doit se terminer par .heic.")
+    }
+    guard input.standardizedFileURL != output.standardizedFileURL,
+          !files.fileExists(atPath: output.path) else {
+        throw PhotoError("Le fichier de sortie existe déjà. Choisis un autre nom.")
+    }
+    guard let source = CGImageSourceCreateWithURL(input as CFURL, nil), CGImageSourceGetCount(source) > 0,
+          let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020),
+          let pqSpace = CGColorSpace(name: CGColorSpace.itur_2100_PQ) else {
+        throw PhotoError("Impossible de lire cette photo. Vérifie que le fichier est une image prise en charge.")
+    }
+    let scratch = output.deletingLastPathComponent()
+        .appendingPathComponent(".hdr-photo-\(UUID().uuidString)", isDirectory: true)
+    try cancellation.prepare(scratch)
+    defer { cancellation.clean() }
+
+    let staged = scratch.appendingPathComponent("export.heic")
+    var decoded = try decode(source, linearSpace: linearSpace)
+    if decoded == nil, isHEIF(source), let decoder = executable("heif-convert") {
+        let index = CGImageSourceGetPrimaryImageIndex(source)
+        var hasGainMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil
+        if #available(macOS 15.0, *) {
+            hasGainMap = hasGainMap || CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeISOGainMap) != nil
+        }
+        guard !hasGainMap else {
+            throw PhotoError("macOS n’a pas pu lire la couche HDR de cette photo HEIC. Exporte d’abord la photo en PNG HDR depuis Photos ou ton éditeur.")
+        }
+        let fallback = scratch.appendingPathComponent("source.png")
+        try run(decoder, [input.path, fallback.path])
+        if let png = CGImageSourceCreateWithURL(fallback as CFURL, nil) {
+            decoded = try decode(png, linearSpace: linearSpace)
+        }
+    }
+    guard let decoded else {
+        throw PhotoError("Impossible de décoder cette photo. Pour les HEIC, installe libheif avec « brew install libheif ».")
+    }
+    let image = try render(decoded, strength: strength, pqSpace: pqSpace)
+
+    // ImageIO can write ISO HDR directly on supported Macs. Verify depth and
+    // transfer before accepting its output; some macOS environments disable HEVC.
+    if #available(macOS 15.0, *),
+       let destination = CGImageDestinationCreateWithURL(staged as CFURL, UTType.heic.identifier as CFString, 1, nil) {
+        let options = [kCGImageDestinationEncodeRequest: kCGImageDestinationEncodeToISOHDR as Any,
+                       kCGImageDestinationLossyCompressionQuality: 0.94] as CFDictionary
+        CGImageDestinationAddImage(destination, image, options)
+        if CGImageDestinationFinalize(destination),
+           let result = CGImageSourceCreateWithURL(staged as CFURL, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(result, CGImageSourceGetPrimaryImageIndex(result), nil) as? [CFString: Any],
+           (properties[kCGImagePropertyDepth] as? NSNumber)?.intValue == 10,
+           let cgResult = CGImageSourceCreateImageAtIndex(result, CGImageSourceGetPrimaryImageIndex(result), nil),
+           let profile = cgResult.colorSpace, CGColorSpaceIsPQBased(profile) {
+            try files.moveItem(at: staged, to: output)
+            return
+        }
+        try? files.removeItem(at: staged)
+    }
+
+    guard let encoder = executable("heif-enc") else {
+        throw PhotoError("L’encodeur HDR de macOS est indisponible. Installe libheif avec « brew install libheif ».")
+    }
+    let intermediate = scratch.appendingPathComponent("hdr.png")
+    guard let png = CGImageDestinationCreateWithURL(intermediate as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        throw PhotoError("Impossible de créer le fichier HDR temporaire.")
+    }
+    CGImageDestinationAddImage(png, image, nil)
+    guard CGImageDestinationFinalize(png) else {
+        throw PhotoError("Impossible d’écrire le fichier HDR temporaire.")
+    }
+    try run(encoder, ["-q", "94", "-b", "10", "--colour_primaries", "9", "--transfer_characteristic", "16",
+                      "--matrix_coefficients", "9", "--enable-two-colr-boxes", "-o", staged.path, intermediate.path])
+    try files.moveItem(at: staged, to: output)
+}
+
+do {
+    guard #available(macOS 14.0, *) else {
+        throw PhotoError("L’export HEIC HDR nécessite macOS Sonoma 14 ou version ultérieure.")
+    }
+    let arguments = CommandLine.arguments
+    guard arguments.count == 4, let strength = Float(arguments[3]), strength.isFinite,
+          (0.0...1.0).contains(strength) else {
+        throw PhotoError("Utilisation : hdr-photo <photo-source> <sortie.heic> <intensité entre 0 et 1>")
+    }
+    try exportPhoto(input: URL(fileURLWithPath: arguments[1]),
+                    output: URL(fileURLWithPath: arguments[2]), strength: strength)
+} catch {
+    FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+    exit(EXIT_FAILURE)
+}

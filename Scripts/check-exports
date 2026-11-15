@@ -1,0 +1,31 @@
+#!/bin/bash
+# Run after Scripts/build-app. Use generated media only.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+APP="$ROOT/dist/HDR Studio.app/Contents"
+WORK="$(mktemp -d /tmp/hdr-studio-check.XXXXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+ffmpeg -v error -f lavfi -i 'testsrc=size=320x180:rate=1' -frames:v 1 "$WORK/photo été.png"
+ffmpeg -v error -f lavfi -i 'testsrc2=size=320x180:rate=24' \
+  -f lavfi -i 'sine=frequency=440' -t 1 -c:v libx264 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -c:a aac "$WORK/vidéo été.mp4"
+
+"$APP/MacOS/hdr-photo" "$WORK/photo été.png" "$WORK/test.heic" 0.65
+photo="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,pix_fmt,color_transfer,color_primaries -of default=nw=1 "$WORK/test.heic")"
+for value in codec_name=hevc width=320 height=180 pix_fmt=yuv420p10le color_primaries=bt2020 color_transfer=smpte2084; do
+  printf '%s\n' "$photo" | grep -Fqx "$value"
+done
+printf '✓ Photo : HEIC HDR PQ 10 bits\n'
+
+for format in hlg pq; do
+  "$APP/Resources/hdr-video" "$WORK/vidéo été.mp4" "$WORK/$format.mov" "$format" 0.65 > "$WORK/$format.progress"
+  if [[ "$format" = hlg ]]; then transfer=arib-std-b67; else transfer=smpte2084; fi
+  video="$(ffprobe -v error -show_entries stream=codec_name,profile,codec_tag_string,width,height,pix_fmt,color_space,color_transfer,color_primaries -of default=nw=1 "$WORK/$format.mov")"
+  for value in codec_name=hevc codec_name=aac 'profile=Main 10' codec_tag_string=hvc1 width=320 height=180 pix_fmt=yuv420p10le color_space=bt2020nc color_primaries=bt2020 "color_transfer=$transfer"; do
+    printf '%s\n' "$video" | grep -Fqx "$value"
+  done
+  grep -qx 'progress=end' "$WORK/$format.progress"
+  printf '✓ Vidéo : Rec. 2100 %s, HEVC 10 bits, audio AAC\n' "$format"
+done

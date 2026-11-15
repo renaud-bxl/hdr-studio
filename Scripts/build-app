@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+BUILD="$ROOT/.build/release"
+DIST="$ROOT/dist"
+ARCH="$(uname -m)"
+APP="$BUILD/HDR Studio.app"
+TARGET="$ARCH-apple-macosx14.0"
+export CLANG_MODULE_CACHE_PATH="$BUILD/module-cache"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST"
+
+printf 'Compilation pour macOS (%s)…\n' "$ARCH"
+swiftc -swift-version 5 -target "$TARGET" -O -parse-as-library \
+  "$ROOT/Sources/HDRStudio.swift" -o "$APP/Contents/MacOS/HDRStudio"
+swiftc -swift-version 5 -target "$TARGET" -O \
+  "$ROOT/Sources/HDRPhoto.swift" -o "$APP/Contents/MacOS/hdr-photo"
+install -m 755 "$ROOT/Scripts/hdr-video" "$APP/Contents/Resources/hdr-video"
+swift "$ROOT/Scripts/make-icon.swift" "$APP/Contents/Resources/HDRStudio.icns"
+install -m 644 "$ROOT/Sources/Info.plist" "$APP/Contents/Info.plist"
+/usr/bin/codesign --force --sign - "$APP/Contents/MacOS/hdr-photo"
+/usr/bin/codesign --force --sign - "$APP"
+/usr/bin/codesign --verify --strict "$APP"
+
+# Replace the previous build only after a complete, signed bundle is available.
+rm -rf "$DIST/HDR Studio.app"
+/usr/bin/ditto "$APP" "$DIST/HDR Studio.app"
+/usr/bin/ditto -c -k --keepParent "$DIST/HDR Studio.app" "$DIST/HDR Studio-macOS-$ARCH.zip"
+printf 'Application : %s\n' "$DIST/HDR Studio.app"
+printf 'Archive     : %s\n' "$DIST/HDR Studio-macOS-$ARCH.zip"

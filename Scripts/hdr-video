@@ -1,0 +1,283 @@
+#!/bin/bash
+# Convert to a standard Rec.2100 HLG or PQ HEVC Main 10 QuickTime movie.
+set -euo pipefail
+export LC_ALL=C
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+
+if [[ $# != 4 ]]; then
+    printf 'Usage : hdr-video source sortie.mov hlg|pq intensite_0_a_1\n' >&2
+    exit 64
+fi
+
+source_file=$1
+output_file=$2
+target=$3
+strength=$4
+case "$target" in
+    hlg) transfer=arib-std-b67; transfer_code=18 ;;
+    pq)  transfer=smpte2084; transfer_code=16 ;;
+    *)   fail 'Choisis HLG ou PQ pour la vidéo.' ;;
+esac
+[[ $strength =~ ^([01]([.][0-9]+)?|[.][0-9]+)$ ]] && \
+    /usr/bin/awk -v s="$strength" 'BEGIN { exit !(s >= 0 && s <= 1) }' || \
+    fail 'L’intensité doit être comprise entre 0 et 1.'
+[[ -f "$source_file" && -r "$source_file" ]] || fail 'La vidéo source est introuvable ou illisible.'
+[[ "$output_file" == *.[mM][oO][vV] ]] || fail 'La sortie vidéo doit porter l’extension .mov.'
+[[ $source_file = /* ]] || source_file="$PWD/$source_file"
+[[ $output_file = /* ]] || output_file="$PWD/$output_file"
+[[ ! -e "$output_file" && ! -L "$output_file" ]] || fail 'Un fichier portant ce nom existe déjà.'
+
+# Apps launched from Finder often do not inherit the Homebrew path.
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin"
+ffmpeg=${HDR_FFMPEG:-$(command -v ffmpeg || true)}
+ffprobe=${HDR_FFPROBE:-$(command -v ffprobe || true)}
+[[ -x "$ffmpeg" && -x "$ffprobe" ]] || fail 'Installe FFmpeg et FFprobe (Homebrew : brew install ffmpeg), puis réessaie.'
+
+if ! probe=$("$ffprobe" -v error -select_streams V:0 \
+    -show_entries 'stream=pix_fmt,width,height,color_space,color_transfer,color_primaries,color_range,chroma_location,duration:stream_side_data=dv_profile,dv_bl_signal_compatibility_id:format=duration' \
+    -of default=nw=1 "$source_file"); then
+    fail 'FFprobe ne parvient pas à lire cette vidéo.'
+fi
+
+pix= matrix= trc= primaries= range= chroma= width= height= duration= dv_profile= dv_compat=
+while IFS='=' read -r key value; do
+    case "$key" in
+        pix_fmt) pix=$value ;;
+        color_space) matrix=$value ;;
+        color_transfer) trc=$value ;;
+        color_primaries) primaries=$value ;;
+        color_range) range=$value ;;
+        chroma_location) chroma=$value ;;
+        width) width=$value ;;
+        height) height=$value ;;
+        duration) if [[ -z "$duration" && "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then duration=$value; fi ;;
+        dv_profile) dv_profile=$value ;;
+        dv_bl_signal_compatibility_id) dv_compat=$value ;;
+    esac
+done <<< "$probe"
+[[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || fail 'Aucune piste vidéo n’a été trouvée.'
+
+# Dolby Vision is usable here only via a standard-compatible base image.
+if [[ -n "$dv_profile" ]]; then
+    case "$dv_profile:$dv_compat" in
+        5:*) fail 'La vidéo Dolby Vision profil 5 n’a pas de couche HDR standard exploitable.' ;;
+        *:1|7:*) trc=smpte2084 ;;
+        *:4) trc=arib-std-b67 ;;
+        *:2) [[ "$trc" != smpte2084 && "$trc" != arib-std-b67 ]] || trc=bt709 ;;
+        *) fail 'Ce profil Dolby Vision n’a pas de couche vidéo standard reconnue.' ;;
+    esac
+fi
+
+is_rgb=0
+case "$pix:$matrix" in
+    rgb*:*|bgr*:*|gbr*:*|argb:*|rgba:*|abgr:*|bgra:*|0rgb:*|rgb0:*|0bgr:*|bgr0:*|*:gbr) is_rgb=1 ;;
+esac
+
+# Assume conventional encoding only when source metadata is absent.
+case "$matrix" in
+    ''|unknown|unspecified|reserved)
+        if [[ "$trc" == arib-std-b67 || "$trc" == smpte2084 || "$primaries" == bt2020 ]]; then matrix=bt2020nc
+        elif (( width <= 1024 && height <= 576 )) && (( ! is_rgb )); then matrix=smpte170m
+        else matrix=bt709; fi ;;
+    gbr) matrix=bt709 ;;  # RGB pixels are not transformed by a YCbCr matrix.
+    bt709|bt470bg|smpte170m|smpte240m|fcc|bt2020nc) ;;
+    *) fail "La matrice couleur de cette vidéo n’est pas prise en charge : $matrix." ;;
+esac
+case "$primaries" in
+    ''|unknown|unspecified|reserved)
+        case "$matrix" in
+            bt2020nc) primaries=bt2020 ;;
+            bt470bg|smpte170m|smpte240m) primaries=$matrix ;;
+            *) primaries=bt709 ;;
+        esac ;;
+    bt709|bt2020|bt470bg|smpte170m|smpte240m|smpte432) ;;
+    *) fail "Les primaires de cette vidéo ne sont pas prises en charge : $primaries." ;;
+esac
+case "$trc" in
+    ''|unknown|unspecified|reserved)
+        if (( is_rgb )); then trc=iec61966-2-1; else trc=bt709; fi ;;
+    bt709|bt2020-10|bt2020-12|smpte170m|smpte240m|bt470bg|bt470m|gamma22|gamma28|iec61966-2-1|linear|arib-std-b67|smpte2084) ;;
+    *) fail "La courbe couleur de cette vidéo ne peut pas être convertie : $trc." ;;
+esac
+case "$range" in
+    pc|jpeg|full) range=full ;;
+    tv|mpeg|limited) range=limited ;;
+    *) if (( is_rgb )) || [[ $pix == yuvj* ]]; then range=full; else range=limited; fi ;;
+esac
+case "$chroma" in
+    left|center|topleft|top|bottomleft|bottom) ;;
+    *) if [[ "$dv_compat" == 4 && "$trc" == arib-std-b67 ]]; then chroma=topleft; else chroma=auto; fi ;;
+esac
+
+# The LUT path is private and has no FFmpeg filtergraph metacharacters. Stage the
+# movie next to the output, so it can be moved without a cross-volume copy.
+work_dir=$(mktemp -d /tmp/hdr-video.XXXXXXXX) || fail 'Impossible de préparer la conversion vidéo.'
+stage_dir= child=
+cleanup() {
+    if [[ -n "$stage_dir" ]]; then /bin/rm -rf -- "$stage_dir"; fi
+    /bin/rm -rf -- "$work_dir"
+}
+cancel() {
+    if [[ -n "$child" ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    exit "$1"
+}
+trap cleanup EXIT
+trap 'cancel 143' TERM
+trap 'cancel 130' INT
+stage_dir=$(mktemp -d "${output_file%/*}/.hdr-output.XXXXXXXX") || fail 'Impossible d’écrire dans le dossier de sortie.'
+staged="$stage_dir/video.mov"
+
+remove_dynamic='sidedata=mode=delete:type=DOVI_RPU_BUFFER,sidedata=mode=delete:type=DOVI_METADATA,sidedata=mode=delete:type=DYNAMIC_HDR_PLUS,sidedata=mode=delete:type=DYNAMIC_HDR_VIVID'
+remove_static='sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA,sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL,sidedata=mode=delete:type=AMBIENT_VIEWING_ENVIRONMENT,sidedata=mode=delete:type=ICC_PROFILE'
+scale_dimensions='scale=w=ceil(iw/2)*2:h=ceil(ih/2)*2:flags=bicubic+accurate_rnd'
+if [[ $trc == "$transfer" && $primaries == bt2020 && $matrix == bt2020nc ]] && (( ! is_rgb )); then
+    # Skip gamut and transfer math when they already match.
+    filtering="$remove_dynamic,$scale_dimensions:in_color_matrix=bt2020nc:out_color_matrix=bt2020nc:in_range=$range:out_range=limited:in_chroma_loc=$chroma:out_chroma_loc=topleft"
+else
+    # Transform in display-linear light, in nits. BT.2408 diffuse reference
+    # white is 203 cd/m²; the SDR boost ramps in only above the midtones.
+    # Output a 65³ cube, then use FFmpeg's tetrahedral interpolation per pixel.
+    /usr/bin/awk -v src="$trc" -v dst="$target" -v gamut="$primaries" -v amount="$strength" '
+        function clamp(v) { return (v < 0 ? 0 : (v > 1 ? 1 : v)) }
+        function pq_to_nits(v, p, d) {
+            p = v ^ (1 / m2); d = p - c1;
+            return d <= 0 ? 0 : 10000 * (d / (c2 - c3 * p)) ^ (1 / m1);
+        }
+        function nits_to_pq(v, p) {
+            p = clamp(v / 10000) ^ m1;
+            return ((c1 + c2 * p) / (1 + c3 * p)) ^ m2;
+        }
+        function inv_hlg(v) {
+            return v <= 0.5 ? v*v/3 : (exp((v-hc)/ha)+hb)/12;
+        }
+        function hlg(v) {
+            v = clamp(v);
+            return v <= 1/12 ? sqrt(3*v) : ha*log(12*v-hb)+hc;
+        }
+        function sdr(v) {
+            if (src == "iec61966-2-1") return v <= 0.04045 ? v/12.92 : ((v+0.055)/1.055)^2.4;
+            if (src == "gamma22" || src == "bt470m") return v^2.2;
+            if (src == "gamma28" || src == "bt470bg") return v^2.8;
+            if (src == "linear") return v;
+            return v^2.4;
+        }
+        BEGIN {
+            m1=2610/16384; m2=2523/32; c1=3424/4096; c2=2413/128; c3=2392/128;
+            ha=0.17883277; hb=1-4*ha; hc=0.5-ha*log(4*ha);
+            # Linear RGB conversions into BT.2020, all D65 primaries.
+            if (gamut == "bt2020") {
+                rr=1; gg=1; bb=1;
+            } else if (gamut == "smpte432") {
+                rr=.7538330344; rg=.1985973691; rb=.0475695966;
+                gr=.0457438490; gg=.9417772198; gb=.0124789312;
+                br=-.0012103404; bg=.0176017173; bb=.9836086231;
+            } else if (gamut == "smpte170m" || gamut == "smpte240m") {
+                rr=.5952542064; rg=.3493139197; rb=.0554318739;
+                gr=.0812436618; gg=.8915032956; gb=.0272530426;
+                br=.0155123412; bg=.0819116421; bb=.9025760166;
+            } else if (gamut == "bt470bg") {
+                rr=.6550367767; rg=.3021609650; rb=.0428022583;
+                gr=.0721405557; gg=.9166311288; gb=.0112283155;
+                br=.0171133704; bg=.0978534699; bb=.8850331596;
+            } else {
+                rr=.6274038959; rg=.3292830384; rb=.0433130657;
+                gr=.0690972894; gg=.9195403951; gb=.0113623156;
+                br=.0163914389; bg=.0880133079; bb=.8955952532;
+            }
+
+            n=65;
+            print "LUT_3D_SIZE " n;
+            for (i=0; i<n; i++) {
+                v=i/(n-1);
+                values[i]=src == "smpte2084" ? pq_to_nits(v) : (src == "arib-std-b67" ? inv_hlg(v) : sdr(v));
+            }
+            for (z=0; z<n; z++) for (y=0; y<n; y++) for (x=0; x<n; x++) {
+                r0=values[x]; g0=values[y]; b0=values[z];
+                r=rr*r0+rg*g0+rb*b0;
+                g=gr*r0+gg*g0+gb*b0;
+                b=br*r0+bg*g0+bb*b0;
+                # Clip negative excursions when source colours sit just outside Rec.2020.
+                r=(r>0 ? r : 0); g=(g>0 ? g : 0); b=(b>0 ? b : 0);
+                luma=0.2627*r+0.6780*g+0.0593*b;
+                if (src == "arib-std-b67") {
+                    gain=1000*luma^0.2;
+                } else if (src == "smpte2084") {
+                    gain=1;
+                } else {
+                    knee=clamp((luma-0.30)/0.70);
+                    gain=203*(1+1.8*amount*knee*knee);
+                }
+                r*=gain; g*=gain; b*=gain;
+
+                if (dst == "hlg") {
+                    # HLG reference display: fit PQ highlights using a smooth shoulder.
+                    maxrgb=(r>g ? r : g); if (b>maxrgb) maxrgb=b;
+                    if (src == "smpte2084" && maxrgb>750) {
+                        d=maxrgb-750;
+                        gain=(750+250*d/(d+250))/maxrgb;
+                        r*=gain; g*=gain; b*=gain;
+                    }
+                    luma=(0.2627*r+0.6780*g+0.0593*b)/1000;
+                    gain=luma>0 ? luma^(-1/6)/1000 : 0;
+                    r=hlg(r*gain); g=hlg(g*gain); b=hlg(b*gain);
+                } else {
+                    r=nits_to_pq(r); g=nits_to_pq(g); b=nits_to_pq(b);
+                }
+                printf "%.8f %.8f %.8f\n", r,g,b;
+            }
+        }
+    ' > "$work_dir/convert.cube"
+    filtering="$remove_dynamic,$remove_static,$scale_dimensions:in_color_matrix=$matrix:in_range=$range:out_range=full:in_chroma_loc=$chroma,format=gbrp16le,lut3d=file=$work_dir/convert.cube:interp=tetrahedral,setparams=range=full:color_primaries=bt2020:color_trc=$transfer:colorspace=gbr,scale=out_color_matrix=bt2020nc:in_range=full:out_range=limited:out_chroma_loc=topleft:flags=bicubic+accurate_rnd"
+fi
+
+printf 'duration_us=%s\n' "$(/usr/bin/awk -v d="${duration:-0}" 'BEGIN { printf "%.0f", d*1000000 }')"
+
+encoders=$("$ffmpeg" -hide_banner -encoders 2>/dev/null)
+encode() {
+    local pixel_format=$1
+    shift
+    "$ffmpeg" -hide_banner -nostdin -nostats -loglevel error -xerror -stats_period 0.25 -progress pipe:1 -y \
+        -i "$source_file" -map '0:V:0' -map '0:a?' -map_metadata -1 -map_chapters -1 -sn -dn \
+        -vf "$filtering,format=$pixel_format" -fps_mode vfr "$@" -pix_fmt "$pixel_format" \
+        -tag:v hvc1 -color_primaries:v bt2020 -color_trc:v "$transfer" -colorspace:v bt2020nc -color_range:v tv -chroma_sample_location:v topleft \
+        -bsf:v "hevc_metadata=colour_primaries=9:transfer_characteristics=$transfer_code:matrix_coefficients=9:video_full_range_flag=0:chroma_sample_loc_type=2" \
+        -c:a aac -b:a 192k -movflags +faststart+write_colr \
+        -f mov "$staged" 2> "$work_dir/ffmpeg.log" &
+    child=$!
+    local rc=0
+    wait "$child" || rc=$?
+    child=
+    return "$rc"
+}
+
+verify() {
+    local details
+    details=$("$ffprobe" -v error -select_streams V:0 \
+        -show_entries stream=codec_name,codec_tag_string,profile,pix_fmt,color_space,color_primaries,color_transfer,color_range,chroma_location \
+        -of default=nw=1 "$staged") || return 1
+    [[ $details == *'codec_name=hevc'* && $details == *'codec_tag_string=hvc1'* && $details == *'profile=Main 10'* && \
+        $details == *'pix_fmt=yuv420p10le'* && $details == *'color_space=bt2020nc'* && \
+        $details == *'color_primaries=bt2020'* && $details == *"color_transfer=$transfer"* && \
+        $details == *'color_range=tv'* && $details == *'chroma_location=topleft'* ]]
+}
+
+if [[ $encoders == *' hevc_videotoolbox '* ]] && \
+    encode p010le -c:v hevc_videotoolbox -profile:v main10 -q:v 65 && verify; then
+    :
+elif [[ $encoders == *' libx265 '* ]]; then
+    if ! encode yuv420p10le -c:v libx265 -profile:v main10 -preset fast -crf 17 -x265-params log-level=error; then
+        /bin/cat "$work_dir/ffmpeg.log" >&2
+        fail 'FFmpeg n’a pas pu encoder cette vidéo en HEVC 10 bits.'
+    fi
+    verify || fail 'La vidéo encodée ne contient pas les paramètres HDR 10 bits attendus.'
+else
+    if [[ -s "$work_dir/ffmpeg.log" ]]; then /bin/cat "$work_dir/ffmpeg.log" >&2; fi
+    fail 'Aucun encodeur HEVC 10 bits compatible. Installe FFmpeg avec VideoToolbox ou libx265.'
+fi
+
+/bin/mv -n -- "$staged" "$output_file" || fail 'Impossible d’enregistrer la vidéo convertie.'
+[[ ! -e "$staged" ]] || fail 'Un fichier portant ce nom existe déjà.'
