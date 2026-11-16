@@ -47,16 +47,23 @@ Rendu :
 - **Vidéo HLG** (iPhone) : conversion vers PQ pour un écran de 1000 nits.
 - **Vidéo PQ** : le signal est conservé.
 
-## Ligne de commande et vérifications
+## Ligne de commande (facultatif)
+
+L'application s'utilise par sa fenêtre. Ces commandes servent seulement à convertir sans l'ouvrir.
+Ce sont des exemples : remplace les chemins par ceux de tes propres fichiers (tu peux glisser un
+fichier du Finder dans le Terminal pour écrire son chemin).
 
 ```sh
 APP="$HOME/Desktop/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
-"$APP" --convert-photo photo.jpg photo_HDR.heic 1.3
-"$APP" --convert-video video.mov video_DV.mp4 dv 2.0     # ou hdr10
 
-swiftc -O Scripts/probe-photo.swift -o probe && ./probe photo.jpg photo_HDR.heic
-MP4Box -info video_DV.mp4 | grep -i dolby
+# Photo : source, sortie, intensité en stops
+"$APP" --convert-photo ~/Desktop/ma_photo.jpg ~/Desktop/ma_photo_HDR.heic 1.3
+
+# Vidéo : source, sortie, format (dv ou hdr10), intensité en stops
+"$APP" --convert-video ~/Desktop/ma_video.mov ~/Desktop/ma_video_DV.mp4 dv 2.0
 ```
+
+Pour contrôler un export vidéo : `MP4Box -info ~/Desktop/ma_video_DV.mp4 | grep -i dolby`
 
 ## À savoir
 
