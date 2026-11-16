@@ -1,0 +1,125 @@
+#!/bin/bash
+# Downloads the authenticated GitHub release and installs its checked app bundle.
+set -euo pipefail
+umask 077
+
+readonly repo='renaud-bxl/hdr-studio'
+readonly version='v0.1.0'
+readonly asset='HDR.Studio-macOS-arm64.zip'
+readonly bundle_id='be.renaudbxl.hdrstudio'
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin"
+export GH_PROMPT_DISABLED=1
+
+fail() { printf 'HDR Studio : %s\n' "$*" >&2; exit 1; }
+usage() {
+    printf '%s\n' 'Installation de HDR Studio dans ~/Applications (sans sudo).' \
+        'Usage : install-macos [--destination /chemin/absolu] [--no-deps]'
+}
+
+destination="$HOME/Applications"
+install_deps=1
+while (( $# )); do
+    case "$1" in
+        --destination)
+            (( $# >= 2 )) || fail 'Il manque le dossier après --destination.'
+            destination="$2"
+            shift 2
+            ;;
+        --no-deps) install_deps=0; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; fail "Option inconnue : $1" ;;
+    esac
+done
+
+[[ "$(uname -s)" == Darwin ]] || fail 'Cette application est destinée à macOS.'
+macos="$(sw_vers -productVersion)"
+major="${macos%%.*}"
+[[ "$major" =~ ^[0-9]+$ ]] && (( major >= 14 )) || fail 'macOS 14 Sonoma ou une version plus récente est nécessaire.'
+if [[ "$(uname -m)" != arm64 && "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || true)" != 1 ]]; then
+    fail 'Cette version est destinée aux Mac Apple Silicon (M1 ou plus récent).'
+fi
+[[ "$destination" = /* ]] || fail 'Indique le chemin absolu du dossier d’installation.'
+command -v gh >/dev/null 2>&1 || fail 'Installe GitHub CLI avec « brew install gh », puis connecte-toi avec « gh auth login ».'
+
+printf 'Vérification de l’accès à HDR Studio %s sur GitHub…\n' "${version#v}"
+if ! digest="$(gh api --hostname github.com "repos/$repo/releases/tags/$version" \
+        --jq ".assets[] | select(.name == \"$asset\" and .state == \"uploaded\") | .digest")"; then
+    fail 'Connexion au dépôt privé impossible. Lance « gh auth login » avec le compte qui a accès au dépôt, puis réessaie.'
+fi
+[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'L’empreinte de l’archive attendue est introuvable.'
+
+/bin/mkdir -p "$destination"
+destination="$(cd "$destination" && pwd -P)"
+installed="$destination/HDR Studio.app"
+work="$(/usr/bin/mktemp -d "${destination%/}/.hdr-studio-install.XXXXXXXX")"
+lock="$destination/.hdr-studio-install.lock"
+lock_held=0
+install_complete=0
+backup="$work/previous.app"
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ -d "$backup" ]] && (( ! install_complete )); then
+        if [[ -e "$installed" || -L "$installed" ]] || ! /bin/mv "$backup" "$installed"; then
+            printf 'Installation interrompue. Ancienne copie conservée dans : %s\n' "$backup" >&2
+            if (( lock_held )); then /bin/rmdir "$lock" || true; fi
+            exit "$status"
+        fi
+    fi
+    /bin/rm -rf "$work"
+    if (( lock_held )); then /bin/rmdir "$lock" || true; fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! /bin/mkdir "$lock" 2>/dev/null; then
+    fail 'Une installation est déjà en cours dans ce dossier.'
+fi
+lock_held=1
+
+id_of() { /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist" 2>/dev/null; }
+if [[ -e "$installed" || -L "$installed" ]]; then
+    [[ -d "$installed" && ! -L "$installed" && "$(id_of "$installed")" == "$bundle_id" ]] ||
+        fail "Un autre fichier utilise déjà ce nom : $installed"
+fi
+
+archive="$work/hdr-studio.zip"
+printf 'Téléchargement de l’application…\n'
+gh release download "$version" --repo "github.com/$repo" --pattern "$asset" --output "$archive" ||
+    fail 'Le téléchargement n’a pas abouti. Vérifie ta connexion, puis réessaie.'
+actual="$(/usr/bin/shasum -a 256 "$archive")"
+[[ "${actual%% *}" == "${digest#sha256:}" ]] || fail 'L’archive téléchargée ne correspond pas à l’empreinte publiée sur GitHub.'
+
+/usr/bin/ditto -x -k "$archive" "$work/extract" || fail 'Impossible de décompresser l’archive.'
+staged="$work/extract/HDR Studio.app"
+[[ -d "$staged" && ! -L "$staged" && "$(id_of "$staged")" == "$bundle_id" &&
+   -x "$staged/Contents/MacOS/HDRStudio" ]] || fail 'L’archive ne contient pas l’application HDR Studio attendue.'
+/usr/bin/codesign --verify --deep --strict "$staged" || fail 'La signature du fichier téléchargé n’est pas valide.'
+
+if (( install_deps )); then
+    dependencies=()
+    if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+        dependencies+=(ffmpeg)
+    fi
+    if ! command -v heif-enc >/dev/null 2>&1 || ! command -v heif-convert >/dev/null 2>&1; then
+        dependencies+=(libheif)
+    fi
+    if (( ${#dependencies[@]} )); then
+        if command -v brew >/dev/null 2>&1; then
+            printf 'Installation des outils nécessaires avec Homebrew…\n'
+            brew install "${dependencies[@]}" ||
+                fail "Homebrew n’a pas pu installer ces outils : ${dependencies[*]}. Réessaie après avoir réglé l’erreur affichée."
+        else
+            fail "Installe Homebrew (https://brew.sh), puis « brew install ${dependencies[*]} » et relance la commande."
+        fi
+    fi
+fi
+
+if [[ -d "$installed" ]]; then
+    /bin/mv "$installed" "$backup" || fail 'Impossible de déplacer l’ancienne version.'
+fi
+/bin/mv "$staged" "$installed" || fail 'Impossible de ranger l’application dans le dossier choisi.'
+install_complete=1
+printf 'HDR Studio est installé : %s\n' "$installed"
+printf 'Pour l’ouvrir depuis le Terminal : open "%s"\n' "$installed"

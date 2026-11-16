@@ -2,6 +2,8 @@
 
 Une app native pour macOS qui exporte tes photos en **HEIC HDR 10 bits** et tes vidéos en **HEVC Main 10, Rec. 2100 HLG ou PQ**. Les fichiers sont traités sur le Mac.
 
+[Voir la page de présentation et d’installation](https://hdr-studio-mac.rblbxl.chatgpt.site).
+
 1. Choisis l’onglet **Photo** ou **Vidéo**.
 2. Glisse tes fichiers dans la zone de dépôt ou clique sur **Choisir des fichiers…**.
 3. Pour une vidéo, choisis **Rec. 2100 HLG** ou **Rec. 2100 PQ**.
@@ -11,7 +13,17 @@ L’app traite les lots fichier par fichier. Clique sur **Exporté** pour retrou
 
 ## Installation
 
-macOS 14 ou plus récent. L’archive Apple Silicon est destinée aux Mac équipés d’une puce M1 ou plus récente. Ouvre l’archive et lance **HDR Studio.app**. La conversion vidéo utilise FFmpeg installé sur le Mac. L’encodeur photo est natif ; libheif sert de solution de repli si l’encodeur macOS est indisponible.
+Sur un Mac Apple Silicon (M1 ou plus récent) avec macOS 14 ou supérieur, connecte [GitHub CLI](https://cli.github.com/) au compte autorisé à accéder à ce dépôt avec `gh auth login`. Si nécessaire, installe GitHub CLI avec `brew install gh`.
+
+Colle ensuite cette commande dans Terminal :
+
+```sh
+( script="$(mktemp)" && trap 'rm -f "$script"' EXIT && gh api --hostname github.com -H 'Accept: application/vnd.github.raw+json' repos/renaud-bxl/hdr-studio/contents/Scripts/install-macos >"$script" && /bin/bash "$script" )
+```
+
+La commande vérifie l’archive et installe l’app dans `~/Applications`, sans `sudo`. Si nécessaire, elle utilise Homebrew pour installer FFmpeg et libheif.
+
+Tu peux aussi [télécharger l’archive sur GitHub](https://github.com/renaud-bxl/hdr-studio/releases/latest), l’ouvrir et lancer **HDR Studio.app**. La conversion vidéo utilise FFmpeg. L’encodeur photo est natif ; libheif sert de solution de repli si l’encodeur macOS est indisponible.
 
 Avec Homebrew :
 
