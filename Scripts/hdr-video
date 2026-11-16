@@ -14,11 +14,15 @@ source_file=$1
 output_file=$2
 target=$3
 strength=$4
+intermediate=${HDR_VIDEO_INTERMEDIATE:-}
 case "$target" in
     hlg) transfer=arib-std-b67; transfer_code=18 ;;
     pq)  transfer=smpte2084; transfer_code=16 ;;
     *)   fail 'Choisis HLG ou PQ pour la vidéo.' ;;
 esac
+if [[ -n "$intermediate" && ( "$intermediate" != prores || "$target" != hlg ) ]]; then
+    fail 'Le fichier intermédiaire Dolby Vision doit être en HLG.'
+fi
 [[ $strength =~ ^([01]([.][0-9]+)?|[.][0-9]+)$ ]] && \
     /usr/bin/awk -v s="$strength" 'BEGIN { exit !(s >= 0 && s <= 1) }' || \
     fail 'L’intensité doit être comprise entre 0 et 1.'
@@ -240,11 +244,17 @@ encoders=$("$ffmpeg" -hide_banner -encoders 2>/dev/null)
 encode() {
     local pixel_format=$1
     shift
+    local headers=()
+    if [[ "$intermediate" == prores ]]; then
+        headers=(-tag:v apch)
+    else
+        headers=(-tag:v hvc1 -chroma_sample_location:v topleft
+            -bsf:v "hevc_metadata=colour_primaries=9:transfer_characteristics=$transfer_code:matrix_coefficients=9:video_full_range_flag=0:chroma_sample_loc_type=2")
+    fi
     "$ffmpeg" -hide_banner -nostdin -nostats -loglevel error -xerror -stats_period 0.25 -progress pipe:1 -y \
         -i "$source_file" -map '0:V:0' -map '0:a?' -map_metadata -1 -map_chapters -1 -sn -dn \
         -vf "$filtering,format=$pixel_format" -fps_mode vfr "$@" -pix_fmt "$pixel_format" \
-        -tag:v hvc1 -color_primaries:v bt2020 -color_trc:v "$transfer" -colorspace:v bt2020nc -color_range:v tv -chroma_sample_location:v topleft \
-        -bsf:v "hevc_metadata=colour_primaries=9:transfer_characteristics=$transfer_code:matrix_coefficients=9:video_full_range_flag=0:chroma_sample_loc_type=2" \
+        "${headers[@]}" -color_primaries:v bt2020 -color_trc:v "$transfer" -colorspace:v bt2020nc -color_range:v tv \
         -c:a aac -b:a 192k -movflags +faststart+write_colr \
         -f mov "$staged" 2> "$work_dir/ffmpeg.log" &
     child=$!
@@ -259,13 +269,26 @@ verify() {
     details=$("$ffprobe" -v error -select_streams V:0 \
         -show_entries stream=codec_name,codec_tag_string,profile,pix_fmt,color_space,color_primaries,color_transfer,color_range,chroma_location \
         -of default=nw=1 "$staged") || return 1
+    if [[ "$intermediate" == prores ]]; then
+        [[ $details == *'codec_name=prores'* && $details == *'codec_tag_string=apch'* && $details == *'profile=HQ'* &&
+           $details == *'pix_fmt=yuv422p10le'* && $details == *'color_space=bt2020nc'* &&
+           $details == *'color_primaries=bt2020'* && $details == *'color_transfer=arib-std-b67'* &&
+           $details == *'color_range=tv'* ]]
+        return
+    fi
     [[ $details == *'codec_name=hevc'* && $details == *'codec_tag_string=hvc1'* && $details == *'profile=Main 10'* && \
         $details == *'pix_fmt=yuv420p10le'* && $details == *'color_space=bt2020nc'* && \
         $details == *'color_primaries=bt2020'* && $details == *"color_transfer=$transfer"* && \
         $details == *'color_range=tv'* && $details == *'chroma_location=topleft'* ]]
 }
 
-if [[ $encoders == *' hevc_videotoolbox '* ]] && \
+if [[ "$intermediate" == prores ]]; then
+    if ! encode yuv422p10le -c:v prores_ks -profile:v 3; then
+        /bin/cat "$work_dir/ffmpeg.log" >&2
+        fail 'FFmpeg n’a pas pu préparer le fichier HLG intermédiaire pour Dolby Vision.'
+    fi
+    verify || fail 'Le fichier ProRes intermédiaire ne contient pas les paramètres HLG 10 bits attendus.'
+elif [[ $encoders == *' hevc_videotoolbox '* ]] && \
     encode p010le -c:v hevc_videotoolbox -profile:v main10 -q:v 65 && verify; then
     :
 elif [[ $encoders == *' libx265 '* ]]; then

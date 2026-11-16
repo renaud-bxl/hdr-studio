@@ -115,19 +115,51 @@ private func isHEIF(_ source: CGImageSource) -> Bool {
 }
 
 @available(macOS 14.0, *)
-private func decode(_ source: CGImageSource, linearSpace: CGColorSpace) throws -> LinearImage? {
+private func hasGainMap(_ source: CGImageSource, index: Int) -> Bool {
+    if CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil {
+        return true
+    }
+    if #available(macOS 15.0, *) {
+        return CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeISOGainMap) != nil
+    }
+    return false
+}
+
+@available(macOS 14.0, *)
+private func decode(_ source: CGImageSource, linearSpace: CGColorSpace,
+                    maxDimension: Int? = nil) throws -> LinearImage? {
     let index = CGImageSourceGetPrimaryImageIndex(source)
     let metadata = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] ?? [:]
     let rawOrientation = (metadata[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
     let orientation = (1...8).contains(rawOrientation) ? rawOrientation : 1
-    let request = [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
-                   kCGImageSourceShouldCacheImmediately: kCFBooleanTrue as Any] as CFDictionary
-    guard let image = CGImageSourceCreateImageAtIndex(source, index, request) else { return nil }
-    let width = image.width
-    let height = image.height
+    let request: [CFString: Any] = [kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
+                                   kCGImageSourceShouldCacheImmediately: maxDimension == nil]
+    guard let image = CGImageSourceCreateImageAtIndex(source, index, request as CFDictionary) else { return nil }
     // Protect the two full-size processing buffers from excessive allocations.
-    guard width > 0, height > 0, width <= 80_000_000 / height else {
+    guard image.width > 0, image.height > 0, image.width <= 80_000_000 / image.height else {
         throw PhotoError("Cette photo dépasse la limite de 80 mégapixels.")
+    }
+    var isHDR = image.colorSpace.map { CGColorSpaceUsesITUR_2100TF($0) } ?? false
+    if #available(macOS 15.0, *) {
+        isHDR = isHDR || image.contentHeadroom > 1.0
+    }
+    isHDR = isHDR || hasGainMap(source, index: index)
+
+    let longest = max(image.width, image.height)
+    let limit = min(longest, maxDimension ?? longest)
+    let width = max(1, Int((Double(image.width) * Double(limit) / Double(longest)).rounded()))
+    let height = max(1, Int((Double(image.height) * Double(limit) / Double(longest)).rounded()))
+    var raster = image
+    if limit < longest && !isHDR {
+        // Use subsampled decoding when ImageIO can retain the source profile.
+        // Decode HDR sources directly to avoid an SDR thumbnail or a lost gain map.
+        var options = request
+        options[kCGImageSourceCreateThumbnailFromImageAlways] = true
+        options[kCGImageSourceThumbnailMaxPixelSize] = limit
+        if let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary),
+           thumbnail.colorSpace == image.colorSpace {
+            raster = thumbnail
+        }
     }
     let format = CGBitmapInfo.byteOrder32Little.union(.floatComponents).rawValue
         | CGImageAlphaInfo.premultipliedLast.rawValue
@@ -143,12 +175,8 @@ private func decode(_ source: CGImageSource, linearSpace: CGColorSpace) throws -
         // Keep the decoded HDR values; 0 asks Core Graphics not to tone map them.
         _ = canvas.setEDRTargetHeadroom(0)
     }
-    canvas.draw(image, in: bounds)
-    var hasHDR = image.colorSpace.map { CGColorSpaceUsesITUR_2100TF($0) } ?? false
-    if #available(macOS 15.0, *) {
-        hasHDR = hasHDR || image.contentHeadroom > 1.0
-    }
-    hasHDR = hasHDR || CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil
+    if limit < longest { canvas.interpolationQuality = .high }
+    canvas.draw(raster, in: bounds)
 
     if isHEIF(source) {
         // On systems without VideoToolbox decoding, ImageIO can silently draw an
@@ -159,7 +187,7 @@ private func decode(_ source: CGImageSource, linearSpace: CGColorSpace) throws -
             return nil
         }
     }
-    return LinearImage(buffer: canvas, width: width, height: height, orientation: orientation, isHDR: hasHDR)
+    return LinearImage(buffer: canvas, width: width, height: height, orientation: orientation, isHDR: isHDR)
 }
 
 // SMPTE ST 2084. A square-root luminance index retains precision in dark tones.
@@ -218,10 +246,11 @@ private func render(_ image: LinearImage, strength: Float, pqSpace: CGColorSpace
 }
 
 @available(macOS 14.0, *)
-private func exportPhoto(input: URL, output: URL, strength: Float) throws {
+private func exportPhoto(input: URL, output: URL, strength: Float, preview: Bool) throws {
     let files = FileManager.default
-    guard output.pathExtension.lowercased() == "heic" else {
-        throw PhotoError("Le nom du fichier de sortie doit se terminer par .heic.")
+    let resultExtension = preview ? "png" : "heic"
+    guard output.pathExtension.lowercased() == resultExtension else {
+        throw PhotoError("Le nom du fichier de sortie doit se terminer par .\(resultExtension).")
     }
     guard input.standardizedFileURL != output.standardizedFileURL,
           !files.fileExists(atPath: output.path) else {
@@ -237,27 +266,32 @@ private func exportPhoto(input: URL, output: URL, strength: Float) throws {
     try cancellation.prepare(scratch)
     defer { cancellation.clean() }
 
-    let staged = scratch.appendingPathComponent("export.heic")
-    var decoded = try decode(source, linearSpace: linearSpace)
+    let staged = scratch.appendingPathComponent("result.\(resultExtension)")
+    let maxDimension = preview ? 900 : nil
+    var decoded = try decode(source, linearSpace: linearSpace, maxDimension: maxDimension)
     if decoded == nil, isHEIF(source), let decoder = executable("heif-convert") {
         let index = CGImageSourceGetPrimaryImageIndex(source)
-        var hasGainMap = CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeHDRGainMap) != nil
-        if #available(macOS 15.0, *) {
-            hasGainMap = hasGainMap || CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, index, kCGImageAuxiliaryDataTypeISOGainMap) != nil
-        }
-        guard !hasGainMap else {
+        guard !hasGainMap(source, index: index) else {
             throw PhotoError("macOS n’a pas pu lire la couche HDR de cette photo HEIC. Exporte d’abord la photo en PNG HDR depuis Photos ou ton éditeur.")
         }
         let fallback = scratch.appendingPathComponent("source.png")
         try run(decoder, [input.path, fallback.path])
         if let png = CGImageSourceCreateWithURL(fallback as CFURL, nil) {
-            decoded = try decode(png, linearSpace: linearSpace)
+            decoded = try decode(png, linearSpace: linearSpace, maxDimension: maxDimension)
         }
     }
     guard let decoded else {
         throw PhotoError("Impossible de décoder cette photo. Pour les HEIC, installe libheif avec « brew install libheif ».")
     }
     let image = try render(decoded, strength: strength, pqSpace: pqSpace)
+    if preview {
+        // Reuse the export's exact color space and highlight curve, but keep
+        // the preview lossless and independent of a HEVC encoder.
+        try writePNG(image, to: staged)
+        try files.moveItem(at: staged, to: output)
+        print("source_hdr=\(decoded.isHDR ? 1 : 0)")
+        return
+    }
 
     // ImageIO can write ISO HDR directly on supported Macs. Verify depth and
     // transfer before accepting its output; some macOS environments disable HEVC.
@@ -282,29 +316,35 @@ private func exportPhoto(input: URL, output: URL, strength: Float) throws {
         throw PhotoError("L’encodeur HDR de macOS est indisponible. Installe libheif avec « brew install libheif ».")
     }
     let intermediate = scratch.appendingPathComponent("hdr.png")
-    guard let png = CGImageDestinationCreateWithURL(intermediate as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-        throw PhotoError("Impossible de créer le fichier HDR temporaire.")
-    }
-    CGImageDestinationAddImage(png, image, nil)
-    guard CGImageDestinationFinalize(png) else {
-        throw PhotoError("Impossible d’écrire le fichier HDR temporaire.")
-    }
+    try writePNG(image, to: intermediate)
     try run(encoder, ["-q", "94", "-b", "10", "--colour_primaries", "9", "--transfer_characteristic", "16",
                       "--matrix_coefficients", "9", "--enable-two-colr-boxes", "-o", staged.path, intermediate.path])
     try files.moveItem(at: staged, to: output)
+}
+
+private func writePNG(_ image: CGImage, to output: URL) throws {
+    guard let destination = CGImageDestinationCreateWithURL(output as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        throw PhotoError("Impossible de créer le fichier HDR temporaire.")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw PhotoError("Impossible d’écrire le fichier HDR temporaire.")
+    }
 }
 
 do {
     guard #available(macOS 14.0, *) else {
         throw PhotoError("L’export HEIC HDR nécessite macOS Sonoma 14 ou version ultérieure.")
     }
-    let arguments = CommandLine.arguments
-    guard arguments.count == 4, let strength = Float(arguments[3]), strength.isFinite,
+    var arguments = Array(CommandLine.arguments.dropFirst())
+    let preview = arguments.first == "--preview"
+    if preview { arguments.removeFirst() }
+    guard arguments.count == 3, let strength = Float(arguments[2]), strength.isFinite,
           (0.0...1.0).contains(strength) else {
-        throw PhotoError("Utilisation : hdr-photo <photo-source> <sortie.heic> <intensité entre 0 et 1>")
+        throw PhotoError("Utilisation : hdr-photo [--preview] <photo-source> <sortie.heic ou .png> <intensité entre 0 et 1>")
     }
-    try exportPhoto(input: URL(fileURLWithPath: arguments[1]),
-                    output: URL(fileURLWithPath: arguments[2]), strength: strength)
+    try exportPhoto(input: URL(fileURLWithPath: arguments[0]),
+                    output: URL(fileURLWithPath: arguments[1]), strength: strength, preview: preview)
 } catch {
     FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
     exit(EXIT_FAILURE)

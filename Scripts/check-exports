@@ -19,6 +19,21 @@ for value in codec_name=hevc width=320 height=180 pix_fmt=yuv420p10le color_prim
 done
 printf '✓ Photo : HEIC HDR PQ 10 bits\n'
 
+ffmpeg -v error -f lavfi -i 'color=white:size=1200x800' -frames:v 1 "$WORK/white.png"
+for level in 0 1; do
+  "$APP/MacOS/hdr-photo" --preview "$WORK/white.png" "$WORK/preview-$level.png" "$level" | grep -qx 'source_hdr=0'
+done
+preview="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt,color_transfer,color_primaries -of default=nw=1 "$WORK/preview-1.png")"
+for value in width=900 height=600 pix_fmt=rgb48be color_primaries=bt2020 color_transfer=smpte2084; do
+  printf '%s\n' "$preview" | grep -Fqx "$value"
+done
+white_value() {
+  ffmpeg -v error -i "$1" -vf crop=2:2 -frames:v 1 -pix_fmt rgb48le -f rawvideo - |
+    od -An -tu2 | awk 'NR == 1 { print $1 }'
+}
+(( $(white_value "$WORK/preview-1.png") > $(white_value "$WORK/preview-0.png") ))
+printf '✓ Aperçu HDR : réduction en 16 bits, hautes lumières réglables\n'
+
 for format in hlg pq; do
   "$APP/Resources/hdr-video" "$WORK/vidéo été.mp4" "$WORK/$format.mov" "$format" 0.65 > "$WORK/$format.progress"
   if [[ "$format" = hlg ]]; then transfer=arib-std-b67; else transfer=smpte2084; fi
@@ -29,3 +44,26 @@ for format in hlg pq; do
   grep -qx 'progress=end' "$WORK/$format.progress"
   printf '✓ Vidéo : Rec. 2100 %s, HEVC 10 bits, audio AAC\n' "$format"
 done
+
+if [[ "${1:-}" == "--standard" ]]; then exit 0; fi
+
+ffmpeg -v error -f lavfi -i 'color=0x303030:size=640x360:rate=24:duration=1' \
+  -f lavfi -i 'color=0xe0e0e0:size=640x360:rate=24:duration=1' \
+  -f lavfi -i 'sine=frequency=440:duration=2' \
+  -filter_complex '[0:v][1:v]concat=n=2:v=1:a=0[v]' -map '[v]' -map 2:a \
+  -c:v libx264 -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -c:a aac "$WORK/scenes.mp4"
+"$APP/Resources/hdr-dolby" "$WORK/scenes.mp4" "$WORK/dolby.mov" 0.65 > "$WORK/dolby.progress"
+details="$(ffprobe -v error -show_entries 'stream=codec_name,profile,codec_tag_string,pix_fmt,color_space,color_transfer,color_primaries,nb_frames:stream_side_data=side_data_type,dv_profile,dv_bl_signal_compatibility_id,rpu_present_flag' -of default=nw=1 "$WORK/dolby.mov")"
+for value in codec_name=hevc codec_name=aac 'profile=Main 10' codec_tag_string=hvc1 pix_fmt=yuv420p10le color_space=bt2020nc color_primaries=bt2020 color_transfer=arib-std-b67 nb_frames=48 dv_profile=8 dv_bl_signal_compatibility_id=4 rpu_present_flag=1 'side_data_type=Ambient viewing environment'; do
+  printf '%s\n' "$details" | grep -Fqx "$value"
+done
+grep -qx 'progress=end' "$WORK/dolby.progress"
+if command -v dovi_tool >/dev/null; then
+  ffmpeg -v error -i "$WORK/dolby.mov" -map 0:v:0 -c:v copy -bsf:v hevc_mp4toannexb -f hevc "$WORK/video.hevc"
+  dovi_tool extract-rpu -i "$WORK/video.hevc" -o "$WORK/RPU.bin" >/dev/null
+  dovi_tool export -i "$WORK/RPU.bin" -l "level1=$WORK/level1.csv" >/dev/null
+  # Different L1 peak values in the dark and bright shots; not just a Dolby flag.
+  awk -F, 'NR == 2 {dark=$3+0} NR > 1 {light=$3+0} END {exit !(NR==49 && light>dark)}' "$WORK/level1.csv"
+fi
+printf '✓ Vidéo : Dolby Vision 8.4 vérifié, base HLG 10 bits et audio AAC\n'

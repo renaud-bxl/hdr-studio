@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -29,9 +30,11 @@ enum MediaKind: String, CaseIterable, Identifiable {
 }
 
 enum VideoFormat: String, CaseIterable, Identifiable {
-    case hlg, pq
+    case hlg, pq, dolby
     var id: String { rawValue }
-    var label: String { "Rec. 2100 " + rawValue.uppercased() }
+    var label: String { self == .dolby ? "Dolby Vision 8.4" : "Rec. 2100 " + rawValue.uppercased() }
+    var filenameLabel: String { self == .dolby ? "Dolby Vision" : rawValue.uppercased() }
+    var helper: String { self == .dolby ? "hdr-dolby" : "hdr-video" }
 }
 
 struct QueueItem: Identifiable {
@@ -101,15 +104,60 @@ final class ExportControl: @unchecked Sendable {
 }
 
 enum Converter {
+    struct Preview {
+        let png: Data
+        let sourceHDR: Bool
+    }
+
+    private static var environment: [String: String] {
+        var values = ProcessInfo.processInfo.environment
+        values["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" +
+            (values["PATH"].map { ":\($0)" } ?? "")
+        values["LC_ALL"] = "C"
+        return values
+    }
+
+    static func previewPhoto(_ input: URL, strength: Double, control: ExportControl) throws -> Preview {
+        guard let executable = Bundle.main.url(forAuxiliaryExecutable: "hdr-photo") else {
+            throw ExportError(message: "Le moteur photo est introuvable.")
+        }
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("hdr-preview-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let output = scratch.appendingPathComponent("preview.png")
+        let logURL = scratch.appendingPathComponent("preview.log")
+        guard FileManager.default.createFile(atPath: logURL.path, contents: nil) else {
+            throw ExportError(message: "Impossible de préparer l’aperçu.")
+        }
+        let log = try FileHandle(forWritingTo: logURL)
+        defer { try? log.close() }
+        let process = Process()
+        process.executableURL = executable
+        process.environment = environment
+        process.arguments = ["--preview", input.path, output.path, String(strength)]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = log
+        process.standardError = log
+        try control.start(process)
+        defer { control.finished() }
+        process.waitUntilExit()
+        guard !control.isCancelled else { throw CancellationError() }
+        let document = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+        guard process.terminationStatus == 0 else {
+            throw ExportError(message: String(document.trimmingCharacters(in: .whitespacesAndNewlines).suffix(800)))
+        }
+        return Preview(png: try Data(contentsOf: output), sourceHDR: document.contains("source_hdr=1"))
+    }
+
     static func export(
-        _ item: QueueItem, to folder: URL, format: VideoFormat, control: ExportControl,
+        _ item: QueueItem, to folder: URL, format: VideoFormat, photoStrength: Double, control: ExportControl,
         onProgress: (Double) -> Void
     ) throws -> URL {
         let resources = Bundle.main.resourceURL
         let executable: URL?
         switch item.kind {
         case .photo: executable = Bundle.main.url(forAuxiliaryExecutable: "hdr-photo")
-        case .video: executable = resources?.appendingPathComponent("hdr-video")
+        case .video: executable = resources?.appendingPathComponent(format.helper)
         }
         guard let executable, FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw ExportError(message: "Le moteur de conversion est introuvable. Réinstalle HDR Studio.")
@@ -132,13 +180,12 @@ enum Converter {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = pipe
         process.standardError = log
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" +
-            (environment["PATH"].map { ":\($0)" } ?? "")
-        environment["LC_ALL"] = "C"
         process.environment = environment
-        process.arguments = [item.url.path, temporary.path] +
-            (item.kind == .photo ? ["0.65"] : [format.rawValue, "0.65"])
+        let parameters: [String]
+        if item.kind == .photo { parameters = [String(photoStrength)] }
+        else if format == .dolby { parameters = ["0.65"] }
+        else { parameters = [format.rawValue, "0.65"] }
+        process.arguments = [item.url.path, temporary.path] + parameters
 
         try control.start(process)
         defer { control.finished() }
@@ -180,7 +227,7 @@ enum Converter {
         }
 
         let name = item.url.deletingPathExtension().lastPathComponent
-        let label = item.kind == .photo ? "HDR" : format.rawValue.uppercased()
+        let label = item.kind == .photo ? "HDR" : format.filenameLabel
         return try control.publish(temporary, to: folder, basename: "\(name) – \(label)", ext: item.kind.outputExtension)
     }
 }
@@ -188,17 +235,37 @@ enum Converter {
 @MainActor
 final class StudioModel: ObservableObject {
     @Published var kind: MediaKind = .photo {
-        didSet { if oldValue != kind { notice = nil } }
+        didSet {
+            guard oldValue != kind else { return }
+            notice = nil
+            refreshPhotoPreview(resetImage: true)
+        }
     }
-    @Published var videoFormat: VideoFormat = .hlg
+    @Published var videoFormat: VideoFormat = .hlg {
+        didSet { if oldValue != videoFormat { enableRepeatExport(.video) } }
+    }
+    @Published var photoStrength: Double = 0.65 {
+        didSet {
+            guard oldValue != photoStrength else { return }
+            enableRepeatExport(.photo)
+            refreshPhotoPreview()
+        }
+    }
     @Published var isDropTarget = false
     @Published private(set) var items: [QueueItem] = []
+    @Published private(set) var selectedPhotoID: UUID?
+    @Published private(set) var photoPreview: NSImage?
+    @Published private(set) var photoIsHDR = false
+    @Published private(set) var previewIsLoading = false
+    @Published private(set) var previewError: String?
     @Published private(set) var activeKind: MediaKind?
     @Published private(set) var isCancelling = false
     @Published private(set) var notice: String?
     @Published private(set) var folder: URL?
     @Published var issue: Issue?
     private var control: ExportControl?
+    private var previewControl: ExportControl?
+    private var previewTask: Task<Void, Never>?
 
     struct Issue: Identifiable {
         let id = UUID()
@@ -207,6 +274,7 @@ final class StudioModel: ObservableObject {
     }
 
     var visibleItems: [QueueItem] { items.filter { $0.kind == kind } }
+    var selectedPhoto: QueueItem? { items.first { $0.id == selectedPhotoID && $0.kind == .photo } }
     var isBusy: Bool { activeKind != nil }
     var canExport: Bool {
         !isBusy && visibleItems.contains {
@@ -236,6 +304,9 @@ final class StudioModel: ObservableObject {
         for url in supported where !items.contains(where: { $0.url == url }) {
             items.append(QueueItem(url: url, kind: kind))
         }
+        if kind == .photo && selectedPhotoID == nil {
+            selectFirstPhoto()
+        }
         notice = normalized.count != supported.count
             ? "Certains fichiers ne sont pas compatibles avec cet onglet." : nil
     }
@@ -243,11 +314,78 @@ final class StudioModel: ObservableObject {
     func remove(_ id: UUID) {
         guard !isBusy else { return }
         items.removeAll { $0.id == id }
+        if selectedPhotoID == id { selectFirstPhoto() }
     }
 
     func clear() {
         guard !isBusy else { return }
         items.removeAll { $0.kind == kind }
+        if kind == .photo { selectFirstPhoto() }
+        notice = nil
+    }
+
+    func selectPhoto(_ id: UUID) {
+        guard selectedPhotoID != id, items.contains(where: { $0.id == id && $0.kind == .photo }) else { return }
+        selectedPhotoID = id
+        refreshPhotoPreview(resetImage: true)
+    }
+
+    private func selectFirstPhoto() {
+        selectedPhotoID = items.first { $0.kind == .photo }?.id
+        refreshPhotoPreview(resetImage: true)
+    }
+
+    private func stopPhotoPreview() {
+        previewTask?.cancel()
+        previewControl?.cancel()
+        previewTask = nil
+        previewControl = nil
+        previewIsLoading = false
+    }
+
+    private func refreshPhotoPreview(resetImage: Bool = false) {
+        stopPhotoPreview()
+        if resetImage {
+            photoPreview = nil
+            photoIsHDR = false
+        }
+        previewError = nil
+        guard kind == .photo, !isBusy, let input = selectedPhoto?.url else { return }
+        let strength = photoStrength
+        let control = ExportControl()
+        previewControl = control
+        previewIsLoading = true
+        previewTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(140))
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try Converter.previewPhoto(input, strength: strength, control: control)
+                }.value
+                guard !Task.isCancelled, let self, self.previewControl === control else { return }
+                guard let source = CGImageSourceCreateWithData(result.png as CFData, nil),
+                      let rendered = CGImageSourceCreateImageAtIndex(source, 0, [
+                        kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
+                        kCGImageSourceShouldCacheImmediately: true
+                      ] as CFDictionary) else {
+                    throw ExportError(message: "macOS n’a pas pu afficher cette image.")
+                }
+                self.photoPreview = NSImage(cgImage: rendered, size: .zero)
+                self.photoIsHDR = result.sourceHDR
+                self.previewIsLoading = false
+            } catch {
+                guard !Task.isCancelled, let self, self.previewControl === control else { return }
+                self.photoPreview = nil
+                self.previewIsLoading = false
+                self.previewError = error.localizedDescription.isEmpty ? "Aperçu indisponible" : error.localizedDescription
+            }
+        }
+    }
+
+    private func enableRepeatExport(_ kind: MediaKind) {
+        guard !isBusy else { return }
+        for index in items.indices where items[index].kind == kind {
+            if case .done = items[index].status { items[index].status = .ready }
+        }
         notice = nil
     }
 
@@ -273,8 +411,11 @@ final class StudioModel: ObservableObject {
             return true
         }
         let format = videoFormat
+        let strength = photoStrength
         let control = ExportControl()
         self.control = control
+        let resumePreview = kind == .photo && previewIsLoading
+        stopPhotoPreview()
         activeKind = kind
         notice = nil
         folder = destination
@@ -287,7 +428,7 @@ final class StudioModel: ObservableObject {
                 update(item.id, to: .processing(nil))
                 do {
                     let output = try await Task.detached(priority: .userInitiated) { [weak self] in
-                        try Converter.export(item, to: destination, format: format, control: control) { [weak self] value in
+                        try Converter.export(item, to: destination, format: format, photoStrength: strength, control: control) { [weak self] value in
                             Task { @MainActor [weak self] in
                                 self?.progress(item.id, value)
                             }
@@ -312,6 +453,9 @@ final class StudioModel: ObservableObject {
             activeKind = nil
             isCancelling = false
             self.control = nil
+            if resumePreview || (self.photoPreview == nil && self.previewError == nil) {
+                self.refreshPhotoPreview()
+            }
         }
     }
 
@@ -334,19 +478,36 @@ final class StudioModel: ObservableObject {
 struct HDRStudioApp: App {
     var body: some Scene {
         Window("HDR Studio", id: "studio") { StudioView() }
-            .defaultSize(width: 640, height: 620)
+            .defaultSize(width: 680, height: 650)
     }
+}
+
+struct HDRPreviewView: NSViewRepresentable {
+    let image: NSImage
+
+    func makeNSView(context: Context) -> NSImageView {
+        let view = NSImageView()
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.preferredImageDynamicRange = .high
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        view.setAccessibilityLabel("Aperçu de la photo traitée")
+        return view
+    }
+
+    func updateNSView(_ view: NSImageView, context: Context) { view.image = image }
 }
 
 struct StudioView: View {
     @StateObject private var model = StudioModel()
-    private let mint = Color(red: 0.64, green: 0.94, blue: 0.84)
-    private let backdrop = Color(red: 0.065, green: 0.075, blue: 0.09)
-    private let surface = Color(red: 0.095, green: 0.114, blue: 0.133)
+    private let accent = Color(red: 0.83, green: 0.75, blue: 1.0)
+    private let blue = Color(red: 0.68, green: 0.75, blue: 1.0)
+    private let backdrop = Color(red: 0.064, green: 0.061, blue: 0.094)
+    private let surface = Color(red: 0.106, green: 0.098, blue: 0.150)
     private let line = Color.white.opacity(0.11)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 19) {
+        VStack(alignment: .leading, spacing: 16) {
             header
 
             Picker("Type de fichier", selection: $model.kind) {
@@ -372,20 +533,27 @@ struct StudioView: View {
                     .fixedSize()
                     .disabled(model.isBusy)
                 }
-            } else {
-                Label("Sortie : HEIC HDR · 10 bits", systemImage: "checkmark.seal")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-            }
+            } else { photoControls }
 
-            queue
+            if let photo = model.selectedPhoto, model.kind == .photo {
+                HStack(alignment: .top, spacing: 15) {
+                    queue.frame(maxWidth: .infinity)
+                    photoPreview(photo).frame(maxWidth: .infinity)
+                }
+            } else { queue }
             Divider().overlay(line)
             footer
         }
         .padding(27)
         .padding(.top, 7)
-        .frame(minWidth: 535, minHeight: 558)
-        .background(backdrop)
+        .frame(minWidth: 550, minHeight: 568)
+        .background {
+            backdrop.overlay(alignment: .topTrailing) {
+                RadialGradient(colors: [Color(red: 0.16, green: 0.105, blue: 0.254), .clear],
+                               center: .topTrailing, startRadius: 0, endRadius: 430)
+            }
+        }
+        .tint(accent)
         .preferredColorScheme(.dark)
         .alert(item: $model.issue) { issue in
             Alert(title: Text(issue.title), message: Text(issue.message),
@@ -401,7 +569,7 @@ struct StudioView: View {
                 Image(systemName: "circle.lefthalf.filled")
                     .font(.system(size: 23, weight: .semibold))
                     .rotationEffect(.degrees(-30))
-                    .foregroundStyle(mint)
+                    .foregroundStyle(.linearGradient(colors: [accent, blue], startPoint: .topLeading, endPoint: .bottomTrailing))
             }
             .frame(width: 48, height: 48)
             .accessibilityHidden(true)
@@ -414,8 +582,8 @@ struct StudioView: View {
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .tracking(1.2)
                 .padding(.horizontal, 9).padding(.vertical, 5)
-                .foregroundStyle(mint)
-                .background(mint.opacity(0.11), in: Capsule())
+                .foregroundStyle(accent)
+                .background(accent.opacity(0.11), in: Capsule())
                 .accessibilityHidden(true)
         }
     }
@@ -424,7 +592,7 @@ struct StudioView: View {
         VStack(spacing: 8) {
             Image(systemName: "arrow.down.to.line.compact")
                 .font(.system(size: 29, weight: .medium))
-                .foregroundStyle(mint)
+                .foregroundStyle(accent)
                 .accessibilityHidden(true)
             Text(model.kind.title).font(.headline)
             Text(model.kind.description).font(.subheadline).foregroundStyle(.secondary)
@@ -434,13 +602,13 @@ struct StudioView: View {
                 .disabled(model.isBusy)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 154)
+        .frame(height: model.kind == .photo && model.selectedPhoto != nil ? 130 : 154)
         .background(
-            RoundedRectangle(cornerRadius: 16).fill(model.isDropTarget ? mint.opacity(0.14) : surface)
+            RoundedRectangle(cornerRadius: 16).fill(model.isDropTarget ? accent.opacity(0.14) : surface)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 16).strokeBorder(
-                model.isDropTarget ? mint : mint.opacity(0.35),
+                model.isDropTarget ? accent : accent.opacity(0.35),
                 style: StrokeStyle(lineWidth: 1, dash: [5, 5])
             )
         )
@@ -457,6 +625,61 @@ struct StudioView: View {
             }
             return !providers.isEmpty
         }
+    }
+
+    private var photoControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Intensité HDR", systemImage: "sun.max")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("HEIC · 10 bits").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
+                Slider(value: $model.photoStrength, in: 0...1, step: 0.01) {
+                    Text("Intensité HDR")
+                }
+                .labelsHidden()
+                .accessibilityValue(Text("\(Int((model.photoStrength * 100).rounded())) %"))
+                .help("Règle le rehaussement des hautes lumières des photos SDR du lot.")
+                .disabled(model.isBusy)
+                Text("\(Int((model.photoStrength * 100).rounded())) %")
+                    .font(.system(.caption, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(accent)
+                    .frame(width: 43, alignment: .trailing)
+            }
+        }
+    }
+
+    private func photoPreview(_ item: QueueItem) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Text("APERÇU HDR").font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .tracking(1.25)
+                Spacer(minLength: 5)
+                if model.previewIsLoading { ProgressView().controlSize(.mini) }
+                if model.photoIsHDR { Text("Déjà HDR").font(.caption2).help("La plage HDR de cette photo est conservée.") }
+            }
+            .foregroundStyle(.secondary)
+
+            ZStack {
+                Color.black.opacity(0.48)
+                if let image = model.photoPreview {
+                    HDRPreviewView(image: image)
+                        .accessibilityLabel("Aperçu HDR de \(item.url.lastPathComponent)")
+                } else if let problem = model.previewError {
+                    Label("Aperçu indisponible", systemImage: "photo")
+                        .font(.caption).foregroundStyle(.secondary).help(problem)
+                } else {
+                    Label("Calcul de l’aperçu…", systemImage: "photo")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 112, maxHeight: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(line).allowsHitTesting(false))
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var queue: some View {
@@ -491,9 +714,22 @@ struct StudioView: View {
 
     private func fileRow(_ item: QueueItem) -> some View {
         HStack(spacing: 9) {
-            Image(systemName: item.kind.symbol).foregroundStyle(.secondary)
-            Text(item.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            if item.kind == .photo {
+                Button { model.selectPhoto(item.id) } label: {
+                    Label(item.url.lastPathComponent, systemImage: item.kind.symbol)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Aperçu de \(item.url.lastPathComponent)")
+                .accessibilityAddTraits(model.selectedPhotoID == item.id ? .isSelected : [])
                 .help(item.url.path)
+                .disabled(model.isBusy)
+            } else {
+                Label(item.url.lastPathComponent, systemImage: item.kind.symbol)
+                    .lineLimit(1).truncationMode(.middle).help(item.url.path)
+            }
             Spacer(minLength: 12)
             switch item.status {
             case .ready:
@@ -509,7 +745,7 @@ struct StudioView: View {
                 }
             case .done(let output):
                 Button { model.show(output) } label: { Label("Exporté", systemImage: "checkmark.circle.fill") }
-                    .buttonStyle(.borderless).foregroundStyle(mint)
+                    .buttonStyle(.borderless).foregroundStyle(accent)
                     .help("Afficher le fichier dans le Finder")
             case .failed(let reason):
                 Button {
@@ -522,7 +758,7 @@ struct StudioView: View {
         }
         .font(.subheadline)
         .padding(.horizontal, 11).padding(.vertical, 6)
-        .background(surface, in: RoundedRectangle(cornerRadius: 8))
+        .background(model.selectedPhotoID == item.id ? accent.opacity(0.13) : surface, in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var footer: some View {
@@ -547,7 +783,7 @@ struct StudioView: View {
                         .font(.headline).padding(.horizontal, 13).padding(.vertical, 2)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(mint)
+                .tint(accent)
                 .foregroundStyle(model.canExport ? .black : .secondary)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)

@@ -34,11 +34,11 @@ for (size, tag) in [(16, "icp4"), (32, "icp5"), (32, "ic11"), (64, "ic12"), (128
         image.saveGState()
         image.addPath(tile)
         image.clip()
-        gradient(image, rgb(0.11, 0.20, 0.25), rgb(0.035, 0.056, 0.075),
+        gradient(image, rgb(0.22, 0.20, 0.37), rgb(0.05, 0.05, 0.11),
                  from: CGPoint(x: 256, y: 900), to: CGPoint(x: 760, y: 140))
         image.restoreGState()
         image.addPath(tile)
-        image.setStrokeColor(rgb(0.21, 0.34, 0.38))
+        image.setStrokeColor(rgb(0.38, 0.35, 0.58))
         image.setLineWidth(5)
         image.strokePath()
 
@@ -48,13 +48,13 @@ for (size, tag) in [(16, "icp4"), (32, "icp5"), (32, "ic11"), (64, "ic12"), (128
         image.clip()
         image.translateBy(x: 512, y: 512)
         image.rotate(by: -.pi / 6)
-        gradient(image, rgb(0.86, 1.0, 0.91), rgb(0.29, 0.75, 0.65),
+        gradient(image, rgb(0.93, 0.84, 1.0), rgb(0.46, 0.60, 0.96),
                  from: CGPoint(x: -210, y: 200), to: CGPoint(x: -29, y: -240))
         image.clip(to: CGRect(x: 0, y: -300, width: 300, height: 600))
-        gradient(image, rgb(0.27, 0.46, 0.49), rgb(0.10, 0.19, 0.23),
+        gradient(image, rgb(0.47, 0.40, 0.67), rgb(0.16, 0.18, 0.39),
                  from: CGPoint(x: 70, y: 230), to: CGPoint(x: 200, y: -240))
         image.restoreGState()
-        image.setStrokeColor(rgb(0.69, 0.90, 0.85))
+        image.setStrokeColor(rgb(0.77, 0.74, 0.98))
         image.setLineWidth(7)
         image.strokeEllipse(in: disc)
 

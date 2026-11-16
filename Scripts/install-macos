@@ -4,7 +4,6 @@ set -euo pipefail
 umask 077
 
 readonly repo='renaud-bxl/hdr-studio'
-readonly version='v0.1.0'
 readonly asset='HDR.Studio-macOS-arm64.zip'
 readonly bundle_id='be.renaudbxl.hdrstudio'
 export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin"
@@ -41,11 +40,13 @@ fi
 [[ "$destination" = /* ]] || fail 'Indique le chemin absolu du dossier d’installation.'
 command -v gh >/dev/null 2>&1 || fail 'Installe GitHub CLI avec « brew install gh », puis connecte-toi avec « gh auth login ».'
 
-printf 'Vérification de l’accès à HDR Studio %s sur GitHub…\n' "${version#v}"
-if ! digest="$(gh api --hostname github.com "repos/$repo/releases/tags/$version" \
-        --jq ".assets[] | select(.name == \"$asset\" and .state == \"uploaded\") | .digest")"; then
+printf 'Vérification de la dernière version de HDR Studio sur GitHub…\n'
+if ! release="$(gh api --hostname github.com "repos/$repo/releases/latest" \
+        --jq ".tag_name as \$tag | .assets[] | select(.name == \"$asset\" and .state == \"uploaded\") | [\$tag, .digest] | @tsv")"; then
     fail 'Connexion au dépôt privé impossible. Lance « gh auth login » avec le compte qui a accès au dépôt, puis réessaie.'
 fi
+IFS=$'\t' read -r version digest <<< "$release"
+[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'La dernière version pour Mac est introuvable.'
 [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'L’empreinte de l’archive attendue est introuvable.'
 
 /bin/mkdir -p "$destination"
@@ -85,7 +86,7 @@ if [[ -e "$installed" || -L "$installed" ]]; then
 fi
 
 archive="$work/hdr-studio.zip"
-printf 'Téléchargement de l’application…\n'
+printf 'Téléchargement de HDR Studio %s…\n' "${version#v}"
 gh release download "$version" --repo "github.com/$repo" --pattern "$asset" --output "$archive" ||
     fail 'Le téléchargement n’a pas abouti. Vérifie ta connexion, puis réessaie.'
 actual="$(/usr/bin/shasum -a 256 "$archive")"
@@ -95,6 +96,8 @@ actual="$(/usr/bin/shasum -a 256 "$archive")"
 staged="$work/extract/HDR Studio.app"
 [[ -d "$staged" && ! -L "$staged" && "$(id_of "$staged")" == "$bundle_id" &&
    -x "$staged/Contents/MacOS/HDRStudio" ]] || fail 'L’archive ne contient pas l’application HDR Studio attendue.'
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$staged/Contents/Info.plist" 2>/dev/null)" == "${version#v}" ]] ||
+    fail 'La version de l’application ne correspond pas à la version publiée.'
 /usr/bin/codesign --verify --deep --strict "$staged" || fail 'La signature du fichier téléchargé n’est pas valide.'
 
 if (( install_deps )); then
