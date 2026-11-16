@@ -56,18 +56,26 @@ case "$trc" in
 esac
 fall=$((peak / 4))
 
+# Les lignes « P <pourcentage> » et « S <étape> » servent au suivi dans l'application.
+dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" 2>/dev/null | head -1)
+case "$dur" in ''|*[!0-9.]*) dur=0 ;; esac
+
 # 1. Encodage de la base HDR10
-ffmpeg -nostdin -y -i "$src" -an -sn -vf "$vf" -r "$afr" -fps_mode cfr \
+echo "S Encodage"
+ffmpeg -nostdin -y -progress pipe:1 -nostats -i "$src" -an -sn -vf "$vf" -r "$afr" -fps_mode cfr \
   -c:v libx265 -preset fast -crf 19 -pix_fmt yuv420p10le \
   -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
   -x265-params "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:range=limited:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=$peak,$fall:hdr10=1:repeat-headers=1" \
-  -f hevc "$work/base.hevc" 2>"$work/enc.log" || { echo "Échec de l'encodage : $(tail -1 "$work/enc.log")"; exit 1; }
+  -f hevc "$work/base.hevc" 2>"$work/enc.log" \
+  | awk -F= -v d="$dur" '$1=="out_time_us" && d>0 { p=int($2/10000/d); if(p>99)p=99; if(p!=last){ print "P " p; fflush(); last=p } }'
+[ "${PIPESTATUS[0]}" -eq 0 ] || { echo "Échec de l'encodage : $(tail -1 "$work/enc.log")"; exit 1; }
 
 video="$work/base.hevc"
 addopt="fps=$fps"
 
 # 2. Métadonnées Dolby Vision 8.1
 if [ "$mode" = "dv" ]; then
+  echo "S Métadonnées Dolby Vision"
   frames=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of default=nw=1:nk=1 "$work/base.hevc" 2>/dev/null | head -1)
   case "$frames" in ''|*[!0-9]*) echo "Nombre d'images indéterminé"; exit 1 ;; esac
   printf '{"cm_version":"V40","length":%s,"level6":{"max_display_mastering_luminance":1000,"min_display_mastering_luminance":1,"max_content_light_level":%s,"max_frame_average_light_level":%s}}' \
@@ -79,6 +87,7 @@ if [ "$mode" = "dv" ]; then
 fi
 
 # 3. Audio : copie si possible, sinon AAC
+echo "S Assemblage du fichier"
 audio=""
 if [ -n "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$src" 2>/dev/null | head -1)" ]; then
   if ffmpeg -nostdin -y -i "$src" -vn -sn -map 0:a:0 -c:a copy "$work/audio.m4a" >/dev/null 2>&1; then

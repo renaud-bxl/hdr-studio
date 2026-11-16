@@ -83,7 +83,9 @@ func convertPhoto(_ src: URL, _ out: URL, stops: Double) -> String? {
     return nil
 }
 
-func convertVideo(_ src: URL, _ out: URL, mode: String, stops: Double) -> String? {
+/// Lance le moteur vidéo. `onProgress` reçoit un texte d'état et l'avancement du fichier (0 à 1).
+func convertVideo(_ src: URL, _ out: URL, mode: String, stops: Double,
+                  onProgress: @escaping (String, Double) -> Void = { _, _ in }) -> String? {
     guard let script = Bundle.main.path(forResource: "hdrvideo", ofType: "sh") else {
         return "Moteur vidéo introuvable dans l'app"
     }
@@ -94,11 +96,36 @@ func convertVideo(_ src: URL, _ out: URL, mode: String, stops: Double) -> String
     p.standardOutput = pipe
     p.standardError = pipe
     do { try p.run() } catch { return "Lancement du moteur vidéo impossible" }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+    let start = Date()
+    var buffer = Data()
+    var lastLine = "Erreur inconnue"
+    let handle = pipe.fileHandleForReading
+    while true {
+        let chunk = handle.availableData
+        if chunk.isEmpty { break }
+        buffer.append(chunk)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = String(data: buffer[buffer.startIndex..<nl], encoding: .utf8) ?? ""
+            buffer.removeSubrange(buffer.startIndex...nl)
+            if line.hasPrefix("P "), let pct = Double(line.dropFirst(2)) {
+                var text = "Encodage \(Int(pct)) %"
+                let elapsed = Date().timeIntervalSince(start)
+                if pct >= 3, elapsed > 8 {
+                    let left = elapsed * (100 - pct) / pct
+                    text += left < 60 ? " · moins d'une minute" : " · environ \(Int((left / 60).rounded(.up))) min restantes"
+                }
+                onProgress(text, pct / 100 * 0.94)
+            } else if line.hasPrefix("S ") {
+                let stage = String(line.dropFirst(2))
+                if stage != "Encodage" { onProgress(stage + "…", stage.hasPrefix("Assemblage") ? 0.98 : 0.95) }
+            } else if !line.isEmpty {
+                lastLine = line
+            }
+        }
+    }
     p.waitUntilExit()
-    if p.terminationStatus == 0 { return nil }
-    let text = String(data: data, encoding: .utf8) ?? ""
-    return text.split(separator: "\n").last.map(String.init) ?? "Erreur inconnue"
+    return p.terminationStatus == 0 ? nil : lastLine
 }
 
 // MARK: - Mode ligne de commande (tests)
@@ -307,6 +334,7 @@ final class DropZone: NSView {
 final class FileRow: NSView {
     private let item: Item
     private let onAction: () -> Void
+    let detailLabel = makeLabel("", size: 11.5, color: Theme.dim)
 
     init(item: Item, locked: Bool, onAction: @escaping () -> Void) {
         self.item = item
@@ -316,7 +344,7 @@ final class FileRow: NSView {
         translatesAutoresizingMaskIntoConstraints = false
 
         let name = makeLabel(item.url.lastPathComponent, size: 13, weight: .medium)
-        let detail = makeLabel("", size: 11.5, color: Theme.dim)
+        let detail = detailLabel
         let texts = NSStackView(views: [name, detail])
         texts.orientation = .vertical
         texts.alignment = .leading
@@ -340,7 +368,7 @@ final class FileRow: NSView {
             sp.translatesAutoresizingMaskIntoConstraints = false
             sp.startAnimation(nil)
             lead = sp
-            detail.stringValue = "Conversion en cours…"
+            detail.stringValue = item.message.isEmpty ? "Conversion en cours…" : item.message
             detail.textColor = Theme.accent
         case .done:
             lead = FileRow.symbol("checkmark.circle.fill", Theme.ok)
@@ -434,6 +462,7 @@ final class MainController: NSObject, NSApplicationDelegate {
     var items: [[Item]] = [[], []]
     var running = false
     var destination: URL?
+    weak var runningRow: FileRow?
 
     let segment = Segment(titles: ["Photo", "Vidéo"])
     let badge = Badge()
@@ -680,6 +709,7 @@ final class MainController: NSObject, NSApplicationDelegate {
         emptyLabel.isHidden = !list.isEmpty
 
         listDoc.subviews.forEach { $0.removeFromSuperview() }
+        runningRow = nil
         let w = max(scroll.contentSize.width, 100)
         let rowH: CGFloat = 48, gap: CGFloat = 6
         for (i, it) in list.enumerated() {
@@ -688,6 +718,7 @@ final class MainController: NSObject, NSApplicationDelegate {
             row.autoresizingMask = [.width]
             row.frame = NSRect(x: 0, y: CGFloat(i) * (rowH + gap), width: w, height: rowH)
             listDoc.addSubview(row)
+            if it.state == .running { runningRow = row }
         }
         listDoc.autoresizingMask = [.width]
         listDoc.frame = NSRect(x: 0, y: 0, width: w, height: max(CGFloat(list.count) * (rowH + gap), 1))
@@ -787,17 +818,24 @@ final class MainController: NSObject, NSApplicationDelegate {
         refreshAll()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            for it in pending {
+            for (idx, it) in pending.enumerated() {
                 DispatchQueue.main.sync { it.state = .running; it.message = ""; self.reloadList() }
                 let stem = it.url.deletingPathExtension().lastPathComponent
                 let out = m == 0
                     ? uniqueURL(in: dest, stem: stem, suffix: "_HDR", ext: "heic")
                     : uniqueURL(in: dest, stem: stem, suffix: format == "dv" ? "_DV" : "_HDR10", ext: "mp4")
                 let err = m == 0 ? convertPhoto(it.url, out, stops: stops)
-                                 : convertVideo(it.url, out, mode: format, stops: stops)
+                                 : convertVideo(it.url, out, mode: format, stops: stops) { text, frac in
+                                     DispatchQueue.main.async {
+                                         guard it.state == .running else { return }
+                                         it.message = text
+                                         self.runningRow?.detailLabel.stringValue = text
+                                         self.progress.doubleValue = Double(idx) + frac
+                                     }
+                                 }
                 DispatchQueue.main.sync {
                     if let err { it.state = .failed; it.message = err } else { it.state = .done; it.output = out }
-                    self.progress.doubleValue += 1
+                    self.progress.doubleValue = Double(idx + 1)
                     self.reloadList()
                 }
             }
