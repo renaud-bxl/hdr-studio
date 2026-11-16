@@ -1,4 +1,3 @@
-HDRStudio
-HDR Studio Claude.app/
+build/
 *.dmg
-stage/
+.DS_Store
