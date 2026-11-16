@@ -132,7 +132,7 @@
 cd hdr-studio &amp;&amp; ./install.sh</pre>
         <button class="copy" id="copy" type="button">Copier</button>
       </div>
-      <p>Le script installe au besoin ffmpeg, dovi_tool et gpac avec Homebrew, compile l'application et la dépose sur le Bureau. Il faut Homebrew et les outils Xcode (<code>xcode-select --install</code>).</p>
+      <p>Le script installe au besoin ffmpeg, dovi_tool et gpac avec Homebrew, compile l'application et l'installe dans le dossier Applications. Il faut Homebrew et les outils Xcode (<code>xcode-select --install</code>).</p>
     </div>
   </div>
 
@@ -197,7 +197,7 @@ cd hdr-studio &amp;&amp; ./install.sh</pre>
       </table>
     </div>
     <p class="sub" style="margin-top:18px">Facultatif : en ligne de commande, en remplaçant les chemins par ceux de tes fichiers.</p>
-    <pre>APP="$HOME/Desktop/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
+    <pre>APP="/Applications/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
 "$APP" --convert-photo ~/Desktop/ma_photo.jpg ~/Desktop/ma_photo_HDR.heic 1.3
 "$APP" --convert-video ~/Desktop/ma_video.mov ~/Desktop/ma_video_DV.mp4 dv 2.0</pre>
   </section>

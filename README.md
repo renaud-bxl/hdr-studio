@@ -13,7 +13,7 @@ cd hdr-studio && ./install.sh
 ```
 
 Le script installe au besoin `ffmpeg`, `dovi_tool` et `gpac` avec Homebrew, compile
-l'application et dépose « HDR Studio Claude.app » sur le Bureau.
+l'application et installe « HDR Studio Claude » dans le dossier Applications.
 
 Prérequis : macOS 14 ou plus récent, [Homebrew](https://brew.sh), outils Xcode
 (`xcode-select --install`).
@@ -54,7 +54,7 @@ Ce sont des exemples : remplace les chemins par ceux de tes propres fichiers (tu
 fichier du Finder dans le Terminal pour écrire son chemin).
 
 ```sh
-APP="$HOME/Desktop/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
+APP="/Applications/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
 
 # Photo : source, sortie, intensité en stops
 "$APP" --convert-photo ~/Desktop/ma_photo.jpg ~/Desktop/ma_photo_HDR.heic 1.3

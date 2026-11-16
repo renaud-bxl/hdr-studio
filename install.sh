@@ -56,7 +56,11 @@ cat > "$app/Contents/Info.plist" <<'PL'
 PL
 codesign --force --deep --sign - "$app" 2>/dev/null || true
 
-echo "== Installation sur le Bureau =="
-rm -rf "$HOME/Desktop/$name.app"
-cp -R "$app" "$HOME/Desktop/$name.app"
-echo "Terminé : « $name.app » est sur ton Bureau."
+echo "== Installation dans Applications =="
+dest="/Applications"
+if [ ! -w "$dest" ]; then dest="$HOME/Applications"; mkdir -p "$dest"; fi
+pkill -f "$name.app/Contents/MacOS/HDRStudio" 2>/dev/null || true
+rm -rf "$dest/$name.app"
+cp -R "$app" "$dest/$name.app"
+echo "Terminé : « $name » est installée dans $dest."
+echo "Pour la lancer : open \"$dest/$name.app\""
