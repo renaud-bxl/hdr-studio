@@ -6,7 +6,7 @@ Une app native pour macOS qui exporte tes photos en **HEIC HDR 10 bits** et tes 
 
 1. Choisis l’onglet **Photo** ou **Vidéo**.
 2. Glisse tes fichiers dans la zone de dépôt ou clique sur **Choisir des fichiers…**.
-3. Dans **Photo**, sélectionne un fichier dans la liste et règle **Intensité HDR** pour voir l’aperçu. Dans **Vidéo**, choisis **Rec. 2100 HLG**, **Rec. 2100 PQ** ou **Dolby Vision 8.4**.
+3. Dans **Photo**, sélectionne un fichier dans la liste, règle **Intensité HDR** et clique sur **Sans effet** pour comparer. Dans **Vidéo**, choisis **Rec. 2100 HLG**, **Rec. 2100 PQ** ou **Dolby Vision 8.4**.
 4. Clique sur **Traiter** et choisis le dossier dans lequel exporter les résultats.
 
 L’app traite les lots fichier par fichier. Clique sur **Exporté** pour retrouver le fichier dans le Finder. Les originaux sont conservés. Si un fichier du même nom existe, le nouvel export reçoit un numéro.
@@ -44,7 +44,7 @@ Après compilation, `./Scripts/check-exports` génère des fichiers de test et v
 
 ## Formats et rendu
 
-- **Photo** : HEIC 10 bits, BT.2020 / PQ. Le curseur règle le rehaussement des hautes lumières d’une source SDR pour le lot. Un clic sur une photo affiche un aperçu calculé avec le même réglage. Les sources déjà HDR reconnues conservent leur plage dynamique. L’aperçu affiche le HDR si l’écran le permet.
+- **Photo** : HEIC 10 bits, BT.2020 / PQ. Le curseur renforce les hautes lumières du lot en laissant les ombres en place. Sur une source déjà HDR, la plage d’origine est conservée jusqu’à 65 % et le rehaussement des zones les plus lumineuses commence au-delà. L’aperçu utilise le réglage d’export ; **Sans effet** permet de le comparer à l’image sans rehaussement. La luminosité visible dépend de l’écran.
 - **Vidéo** : MOV, HEVC Main 10 et BT.2020, avec transfert HLG (`arib-std-b67`) ou PQ (`smpte2084`). L’app transforme les valeurs des pixels pour le transfert choisi et conserve l’audio pris en charge. Elle applique le rehaussement aux sources SDR ; un export HDR existant est converti à partir de sa base HDR compatible.
 - **Dolby Vision 8.4** : MOV HEVC Main 10, base HLG, avec métadonnées dynamiques par image générées par l’encodeur natif de macOS. Le résultat peut être lu en HLG par un lecteur compatible HLG, et en Dolby Vision par un lecteur compatible avec le profil 8.4. Si l’encodeur ne produit pas la signalisation attendue, l’app indique l’échec au lieu d’exporter un simple HLG sous ce nom. Les modes standard HLG et PQ restent disponibles. Une source Dolby Vision sans base compatible (par exemple le profil 5) ne peut pas être convertie directement par cette app.
 - À partir d’un JPEG ou d’une vidéo SDR, passer à 10 bits donne plus de précision au résultat du traitement ; le procédé ne récupère pas les détails déjà écrêtés à la prise de vue.

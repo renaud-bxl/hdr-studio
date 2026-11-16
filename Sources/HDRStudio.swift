@@ -247,6 +247,8 @@ final class StudioModel: ObservableObject {
     @Published var photoStrength: Double = 0.65 {
         didSet {
             guard oldValue != photoStrength else { return }
+            showReference = false
+            comparisonImages.removeValue(forKey: false)
             enableRepeatExport(.photo)
             refreshPhotoPreview()
         }
@@ -256,6 +258,7 @@ final class StudioModel: ObservableObject {
     @Published private(set) var selectedPhotoID: UUID?
     @Published private(set) var photoPreview: NSImage?
     @Published private(set) var photoIsHDR = false
+    @Published private(set) var showReference = false
     @Published private(set) var previewIsLoading = false
     @Published private(set) var previewError: String?
     @Published private(set) var activeKind: MediaKind?
@@ -266,6 +269,7 @@ final class StudioModel: ObservableObject {
     private var control: ExportControl?
     private var previewControl: ExportControl?
     private var previewTask: Task<Void, Never>?
+    private var comparisonImages: [Bool: NSImage] = [:]
 
     struct Issue: Identifiable {
         let id = UUID()
@@ -327,12 +331,27 @@ final class StudioModel: ObservableObject {
     func selectPhoto(_ id: UUID) {
         guard selectedPhotoID != id, items.contains(where: { $0.id == id && $0.kind == .photo }) else { return }
         selectedPhotoID = id
+        showReference = false
         refreshPhotoPreview(resetImage: true)
     }
 
     private func selectFirstPhoto() {
         selectedPhotoID = items.first { $0.kind == .photo }?.id
+        showReference = false
         refreshPhotoPreview(resetImage: true)
+    }
+
+    func toggleReference() {
+        guard !isBusy && selectedPhoto != nil else { return }
+        showReference.toggle()
+        if let image = comparisonImages[showReference] {
+            stopPhotoPreview()
+            photoPreview = image
+            previewError = nil
+            return
+        }
+        photoPreview = nil
+        refreshPhotoPreview()
     }
 
     private func stopPhotoPreview() {
@@ -346,12 +365,14 @@ final class StudioModel: ObservableObject {
     private func refreshPhotoPreview(resetImage: Bool = false) {
         stopPhotoPreview()
         if resetImage {
+            comparisonImages.removeAll()
             photoPreview = nil
             photoIsHDR = false
         }
         previewError = nil
         guard kind == .photo, !isBusy, let input = selectedPhoto?.url else { return }
-        let strength = photoStrength
+        let isReference = showReference
+        let strength = isReference ? 0 : photoStrength
         let control = ExportControl()
         previewControl = control
         previewIsLoading = true
@@ -369,7 +390,9 @@ final class StudioModel: ObservableObject {
                       ] as CFDictionary) else {
                     throw ExportError(message: "macOS n’a pas pu afficher cette image.")
                 }
-                self.photoPreview = NSImage(cgImage: rendered, size: .zero)
+                let image = NSImage(cgImage: rendered, size: .zero)
+                self.comparisonImages[isReference] = image
+                self.photoPreview = image
                 self.photoIsHDR = result.sourceHDR
                 self.previewIsLoading = false
             } catch {
@@ -641,7 +664,7 @@ struct StudioView: View {
                 }
                 .labelsHidden()
                 .accessibilityValue(Text("\(Int((model.photoStrength * 100).rounded())) %"))
-                .help("Règle le rehaussement des hautes lumières des photos SDR du lot.")
+                .help("Règle les hautes lumières du lot. Pour les photos déjà HDR, le renforcement commence au-delà de 65 %.")
                 .disabled(model.isBusy)
                 Text("\(Int((model.photoStrength * 100).rounded())) %")
                     .font(.system(.caption, design: .monospaced).weight(.semibold))
@@ -654,11 +677,16 @@ struct StudioView: View {
     private func photoPreview(_ item: QueueItem) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                Text("APERÇU HDR").font(.system(size: 10, weight: .semibold, design: .monospaced))
+                Text(model.showReference ? "SANS EFFET" : "APERÇU HDR")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .tracking(1.25)
                 Spacer(minLength: 5)
                 if model.previewIsLoading { ProgressView().controlSize(.mini) }
-                if model.photoIsHDR { Text("Déjà HDR").font(.caption2).help("La plage HDR de cette photo est conservée.") }
+                Button(model.showReference ? "Voir le rendu" : "Sans effet") { model.toggleReference() }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .help("Compare la photo sans rehaussement et avec le réglage du curseur.")
+                    .disabled(model.isBusy || model.photoPreview == nil)
             }
             .foregroundStyle(.secondary)
 
@@ -678,6 +706,12 @@ struct StudioView: View {
             .frame(maxWidth: .infinity, minHeight: 112, maxHeight: .infinity)
             .clipShape(RoundedRectangle(cornerRadius: 9))
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(line).allowsHitTesting(false))
+            if model.photoIsHDR {
+                Text("Source HDR · rehaussement au-delà de 65 %")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .frame(maxHeight: .infinity, alignment: .top)
     }

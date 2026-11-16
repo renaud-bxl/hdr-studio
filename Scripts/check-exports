@@ -19,20 +19,46 @@ for value in codec_name=hevc width=320 height=180 pix_fmt=yuv420p10le color_prim
 done
 printf '✓ Photo : HEIC HDR PQ 10 bits\n'
 
-ffmpeg -v error -f lavfi -i 'color=white:size=1200x800' -frames:v 1 "$WORK/white.png"
-for level in 0 1; do
+ffmpeg -v error -f lavfi -i 'color=white:size=2400x1600' -frames:v 1 "$WORK/white.png"
+for level in 0 0.65 1; do
   "$APP/MacOS/hdr-photo" --preview "$WORK/white.png" "$WORK/preview-$level.png" "$level" | grep -qx 'source_hdr=0'
 done
 preview="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt,color_transfer,color_primaries -of default=nw=1 "$WORK/preview-1.png")"
-for value in width=900 height=600 pix_fmt=rgb48be color_primaries=bt2020 color_transfer=smpte2084; do
+for value in width=1200 height=800 pix_fmt=rgb48be color_primaries=bt2020 color_transfer=smpte2084; do
   printf '%s\n' "$preview" | grep -Fqx "$value"
 done
 white_value() {
-  ffmpeg -v error -i "$1" -vf crop=2:2 -frames:v 1 -pix_fmt rgb48le -f rawvideo - |
+  ffmpeg -v error -i "$1" -vf "${2:-crop=2:2}" -frames:v 1 -pix_fmt rgb48le -f rawvideo - |
     od -An -tu2 | awk 'NR == 1 { print $1 }'
 }
-(( $(white_value "$WORK/preview-1.png") > $(white_value "$WORK/preview-0.png") ))
-printf '✓ Aperçu HDR : réduction en 16 bits, hautes lumières réglables\n'
+base_white="$(white_value "$WORK/preview-0.png")"
+default_white="$(white_value "$WORK/preview-0.65.png")"
+max_white="$(white_value "$WORK/preview-1.png")"
+(( base_white < default_white && default_white < max_white ))
+# The new default is above 800 nits (ST 2084 code above 47,676 of 65,535).
+(( default_white > 47676 ))
+for level in 0 0.65 1; do
+  "$APP/MacOS/hdr-photo" --preview "$WORK/preview-1.png" "$WORK/native-hdr-$level.png" "$level" | grep -qx 'source_hdr=1'
+done
+(( $(white_value "$WORK/native-hdr-0.png") == $(white_value "$WORK/native-hdr-0.65.png") ))
+(( $(white_value "$WORK/native-hdr-1.png") > $(white_value "$WORK/native-hdr-0.65.png") ))
+printf '✓ Aperçu HDR : 16 bits, rehaussement des photos SDR et des hautes lumières HDR\n'
+
+# Inspect the actual HEIC, not only the preview. A white patch gains light;
+# a grey patch at the same input value keeps its midtone between exports.
+ffmpeg -v error -f lavfi -i 'color=white:size=320x180' \
+  -vf 'drawbox=x=0:y=0:w=160:h=180:color=0x707070:t=fill' -frames:v 1 "$WORK/patches.png"
+for level in 0 0.65 1; do
+  "$APP/MacOS/hdr-photo" "$WORK/patches.png" "$WORK/treated-$level.heic" "$level"
+done
+export_base="$(white_value "$WORK/treated-0.heic" crop=2:2:240:90)"
+export_default="$(white_value "$WORK/treated-0.65.heic" crop=2:2:240:90)"
+export_max="$(white_value "$WORK/treated-1.heic" crop=2:2:240:90)"
+grey_base="$(white_value "$WORK/treated-0.heic" crop=2:2:80:90)"
+grey_max="$(white_value "$WORK/treated-1.heic" crop=2:2:80:90)"
+(( export_base < export_default && export_default < export_max && export_default > 47676 ))
+(( grey_max - grey_base < 200 && grey_base - grey_max < 200 ))
+printf '✓ HEIC exporté : hautes lumières au-delà du rendu précédent, tons moyens stables\n'
 
 for format in hlg pq; do
   "$APP/Resources/hdr-video" "$WORK/vidéo été.mp4" "$WORK/$format.mov" "$format" 0.65 > "$WORK/$format.progress"

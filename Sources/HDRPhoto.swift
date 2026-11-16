@@ -207,31 +207,110 @@ private func encodePQ(_ linear: Float) -> UInt16 {
     return UInt16(clamping: Int(value.rounded()))
 }
 
-private func render(_ image: LinearImage, strength: Float, pqSpace: CGColorSpace) throws -> CGImage {
-    let width = image.outputWidth
-    let height = image.outputHeight
+@inline(__always)
+private func highlightGain(luma: Float, peak: Float, isHDR: Bool, sdrLift: Float, hdrLift: Float) -> Float {
+    if isHDR {
+        // At the default level, keep the source HDR. Above it, adjust only
+        // light above diffuse white and ease off as a channel nears the PQ limit.
+        let excess = max(0, luma - 1)
+        guard excess > 0, hdrLift > 0 else { return 1 }
+        let requested = hdrLift * (excess / (excess + 0.3)) * (excess / luma)
+        let room = max(0, (10_000 / 203.0) / peak - 1)
+        return 1 + (requested * room) / (requested + room)
+    }
+
+    // Keep the SDR midtones while expanding the top of the range.
+    let t = min(1, max(0, (luma - 0.32) / 0.68))
+    return 1 + sdrLift * t * t * (3 - 2 * t)
+}
+
+// Each destination pixel represents an area of the processed source. Fractions
+// at the edges are kept as integer weights, including at odd sizes.
+private struct AreaSpan {
+    let lower: Int
+    let upper: Int
+    let range: Range<Int>
+    let step: Int
+
+    init(index: Int, sourceSize: Int, targetSize: Int) {
+        lower = index * sourceSize
+        upper = lower + sourceSize
+        step = targetSize
+        range = (lower / step)..<((upper + step - 1) / step)
+    }
+
+    @inline(__always)
+    func weight(_ index: Int) -> Float {
+        Float(min(upper, (index + 1) * step) - max(lower, index * step))
+    }
+}
+
+private func render(_ image: LinearImage, strength: Float, pqSpace: CGColorSpace,
+                    previewLimit: Int? = nil) throws -> CGImage {
+    let sourceWidth = image.outputWidth
+    let sourceHeight = image.outputHeight
+    let longest = max(sourceWidth, sourceHeight)
+    let limit = min(longest, previewLimit ?? longest)
+    let width = max(1, Int((Double(sourceWidth) * Double(limit) / Double(longest)).rounded()))
+    let height = max(1, Int((Double(sourceHeight) * Double(limit) / Double(longest)).rounded()))
     guard let storage = image.buffer.data else { throw PhotoError("La photo n’a pas pu être rendue.") }
     let input = storage.assumingMemoryBound(to: Float.self)
     var output = Data(count: width * height * 8)
-    let liftStrength: Float = image.isHDR ? 0.0 : strength * 3.9
+    let sdrLift = strength * (3.9 + 1.8 * strength)
+    let extra = max(0, (strength - 0.65) / 0.35)
+    let hdrLift = 0.40 * extra * extra
+
+    @inline(__always)
+    func processPixel(x: Int, y: Int) -> (Float, Float, Float) {
+        let source = image.pixelOffset(x: x, y: y)
+        let r = input[source].isFinite ? max(0, input[source]) : 0
+        let g = input[source + 1].isFinite ? max(0, input[source + 1]) : 0
+        let b = input[source + 2].isFinite ? max(0, input[source + 2]) : 0
+        // Alpha is already premultiplied: transparent content is composited onto black.
+        // Lift only the highlights and scale the channels together to preserve hue.
+        let luma = 0.2627 * r + 0.6780 * g + 0.0593 * b
+        let gain = highlightGain(luma: luma, peak: max(r, g, b), isHDR: image.isHDR,
+                                 sdrLift: sdrLift, hdrLift: hdrLift)
+        return (r * gain, g * gain, b * gain)
+    }
+
     output.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
         let pixels = raw.bindMemory(to: UInt16.self)
-        for y in 0..<height {
-            for x in 0..<width {
-                let source = image.pixelOffset(x: x, y: y)
-                let r = max(0, input[source])
-                let g = max(0, input[source + 1])
-                let b = max(0, input[source + 2])
-                // Alpha is already premultiplied: transparent content is composited onto black.
-                // Lift only the highlights and scale the channels together to preserve hue.
-                let luma = 0.2627 * r + 0.6780 * g + 0.0593 * b
-                let t = min(1, max(0, (luma - 0.32) / 0.68))
-                let gain = 1 + liftStrength * t * t * (3 - 2 * t)
-                let target = 4 * (y * width + x)
-                pixels[target] = encodePQ(r * gain)
-                pixels[target + 1] = encodePQ(g * gain)
-                pixels[target + 2] = encodePQ(b * gain)
-                pixels[target + 3] = 65_535
+        @inline(__always)
+        func store(x: Int, y: Int, r: Float, g: Float, b: Float) {
+            let target = 4 * (y * width + x)
+            pixels[target] = encodePQ(r)
+            pixels[target + 1] = encodePQ(g)
+            pixels[target + 2] = encodePQ(b)
+            pixels[target + 3] = 65_535
+        }
+
+        if width == sourceWidth && height == sourceHeight {
+            for y in 0..<height {
+                for x in 0..<width {
+                    let (r, g, b) = processPixel(x: x, y: y)
+                    store(x: x, y: y, r: r, g: g, b: b)
+                }
+            }
+        } else {
+            let columns = (0..<width).map { AreaSpan(index: $0, sourceSize: sourceWidth, targetSize: width) }
+            let rows = (0..<height).map { AreaSpan(index: $0, sourceSize: sourceHeight, targetSize: height) }
+            let normalization = 1 / (Float(sourceWidth) * Float(sourceHeight))
+            for (y, row) in rows.enumerated() {
+                for (x, column) in columns.enumerated() {
+                    var r: Float = 0, g: Float = 0, b: Float = 0
+                    for sy in row.range {
+                        let verticalWeight = row.weight(sy)
+                        for sx in column.range {
+                            let weight = verticalWeight * column.weight(sx)
+                            let (sr, sg, sb) = processPixel(x: sx, y: sy)
+                            r += sr * weight
+                            g += sg * weight
+                            b += sb * weight
+                        }
+                    }
+                    store(x: x, y: y, r: r * normalization, g: g * normalization, b: b * normalization)
+                }
             }
         }
     }
@@ -267,7 +346,8 @@ private func exportPhoto(input: URL, output: URL, strength: Float, preview: Bool
     defer { cancellation.clean() }
 
     let staged = scratch.appendingPathComponent("result.\(resultExtension)")
-    let maxDimension = preview ? 900 : nil
+    let previewLimit: Int? = preview ? 1_200 : nil
+    let maxDimension = previewLimit.map { $0 * 2 }
     var decoded = try decode(source, linearSpace: linearSpace, maxDimension: maxDimension)
     if decoded == nil, isHEIF(source), let decoder = executable("heif-convert") {
         let index = CGImageSourceGetPrimaryImageIndex(source)
@@ -283,10 +363,10 @@ private func exportPhoto(input: URL, output: URL, strength: Float, preview: Bool
     guard let decoded else {
         throw PhotoError("Impossible de décoder cette photo. Pour les HEIC, installe libheif avec « brew install libheif ».")
     }
-    let image = try render(decoded, strength: strength, pqSpace: pqSpace)
+    let image = try render(decoded, strength: strength, pqSpace: pqSpace, previewLimit: previewLimit)
     if preview {
-        // Reuse the export's exact color space and highlight curve, but keep
-        // the preview lossless and independent of a HEVC encoder.
+        // Lift highlights before the final reduction, averaging in linear light.
+        // Averaging first can drop small bright features below the lift threshold.
         try writePNG(image, to: staged)
         try files.moveItem(at: staged, to: output)
         print("source_hdr=\(decoded.isHDR ? 1 : 0)")
