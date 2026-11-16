@@ -5,16 +5,31 @@ import UniformTypeIdentifiers
 // MARK: - Thème
 
 enum Theme {
-    static let bg = NSColor(srgbRed: 0.059, green: 0.063, blue: 0.075, alpha: 1)
-    static let panel = NSColor(srgbRed: 0.098, green: 0.106, blue: 0.125, alpha: 1)
-    static let panelHi = NSColor(srgbRed: 0.149, green: 0.161, blue: 0.188, alpha: 1)
-    static let line = NSColor(white: 1, alpha: 0.09)
-    static let text = NSColor(white: 1, alpha: 0.93)
-    static let dim = NSColor(white: 1, alpha: 0.56)
-    static let accent = NSColor(srgbRed: 1.0, green: 0.72, blue: 0.27, alpha: 1)
-    static let onAccent = NSColor(srgbRed: 0.10, green: 0.07, blue: 0.02, alpha: 1)
+    static let bg = NSColor(srgbRed: 0.055, green: 0.059, blue: 0.082, alpha: 1)
+    static let panel = NSColor(srgbRed: 0.094, green: 0.102, blue: 0.137, alpha: 1)
+    static let panelHi = NSColor(srgbRed: 0.153, green: 0.165, blue: 0.220, alpha: 1)
+    static let line = NSColor(white: 1, alpha: 0.10)
+    static let text = NSColor(white: 1, alpha: 0.95)
+    static let soft = NSColor(white: 1, alpha: 0.80)
+    static let dim = NSColor(white: 1, alpha: 0.60)
+    static let blue = NSColor(srgbRed: 0.247, green: 0.427, blue: 0.965, alpha: 1)      // #3F6DF6
+    static let violet = NSColor(srgbRed: 0.545, green: 0.310, blue: 0.941, alpha: 1)    // #8B4FF0
+    static let accent = NSColor(srgbRed: 0.604, green: 0.659, blue: 1.0, alpha: 1)      // #9AA8FF, texte et pictos
     static let ok = NSColor(srgbRed: 0.43, green: 0.86, blue: 0.62, alpha: 1)
-    static let bad = NSColor(srgbRed: 1.0, green: 0.47, blue: 0.43, alpha: 1)
+    static let bad = NSColor(srgbRed: 1.0, green: 0.50, blue: 0.47, alpha: 1)
+    static var gradient: NSGradient { NSGradient(starting: blue, ending: violet)! }
+}
+
+/// Logo : trois barres de lumière croissante sur un fond dégradé bleu vers mauve.
+func drawLogo(in r: NSRect) {
+    let tile = NSBezierPath(roundedRect: r, xRadius: r.width * 0.24, yRadius: r.width * 0.24)
+    Theme.gradient.draw(in: tile, angle: 45)
+    let w = r.width
+    for (i, spec) in [(0.30, 0.50), (0.46, 0.75), (0.62, 1.0)].enumerated() {
+        let bar = NSRect(x: r.minX + w * (0.22 + 0.21 * CGFloat(i)), y: r.minY + w * 0.21, width: w * 0.14, height: w * CGFloat(spec.0))
+        NSColor(white: 1, alpha: CGFloat(spec.1)).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: w * 0.05, yRadius: w * 0.05).fill()
+    }
 }
 
 func makeLabel(_ s: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = Theme.text) -> NSTextField {
@@ -114,9 +129,10 @@ final class Item {
 // MARK: - Composants
 
 final class FlatButton: NSButton {
-    enum Kind { case primary, secondary, ghost }
+    enum Kind { case primary, secondary, ghost, segment }
     var kind: Kind
-    override var isEnabled: Bool { didSet { restyle() } }
+    var isOn = false { didSet { needsDisplay = true } }
+    override var isEnabled: Bool { didSet { needsDisplay = true } }
 
     init(_ title: String, kind: Kind, target: AnyObject?, action: Selector?) {
         self.kind = kind
@@ -125,71 +141,78 @@ final class FlatButton: NSButton {
         self.target = target
         self.action = action
         isBordered = false
-        wantsLayer = true
         focusRingType = .none
         setButtonType(.momentaryChange)
         translatesAutoresizingMaskIntoConstraints = false
-        restyle()
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); restyle() }
 
-    func setTitle(_ t: String) { title = t; restyle(); invalidateIntrinsicContentSize() }
+    func setTitle(_ t: String) { title = t; invalidateIntrinsicContentSize(); needsDisplay = true }
 
-    func restyle() {
-        let fg: NSColor
-        let bg: NSColor
+    private var labelFont: NSFont {
+        switch kind {
+        case .primary: return .systemFont(ofSize: 14.5, weight: .bold)
+        case .segment: return .systemFont(ofSize: 14, weight: isOn ? .bold : .semibold)
+        case .secondary: return .systemFont(ofSize: 13, weight: .semibold)
+        case .ghost: return .systemFont(ofSize: 13, weight: .semibold)
+        }
+    }
+
+    // Le bouton est dessiné entièrement ici, pour un rendu identique quel que soit l'état de la fenêtre.
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds
+        let radius: CGFloat = kind == .primary ? 11 : (kind == .segment ? 9 : 8)
+        let path = NSBezierPath(roundedRect: r, xRadius: radius, yRadius: radius)
+        var fg = NSColor.white
         switch kind {
         case .primary:
-            bg = isEnabled ? Theme.accent : Theme.panelHi
-            fg = isEnabled ? Theme.onAccent : Theme.dim
+            if isEnabled { Theme.gradient.draw(in: path, angle: 0) } else { Theme.panelHi.setFill(); path.fill(); fg = Theme.dim }
+        case .segment:
+            if isOn { Theme.gradient.draw(in: path, angle: 0) } else { fg = Theme.soft }
         case .secondary:
-            bg = Theme.panelHi
+            Theme.panelHi.setFill(); path.fill()
+            NSColor(white: 1, alpha: 0.14).setStroke()
+            let edge = NSBezierPath(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+            edge.lineWidth = 1; edge.stroke()
             fg = isEnabled ? Theme.text : Theme.dim
         case .ghost:
-            bg = .clear
-            fg = isEnabled ? Theme.dim : Theme.dim.withAlphaComponent(0.4)
+            fg = isEnabled ? Theme.accent : Theme.dim
         }
-        layer?.cornerRadius = kind == .primary ? 11 : 8
-        layer?.backgroundColor = bg.cgColor
-        attributedTitle = NSAttributedString(string: title, attributes: [
-            .foregroundColor: fg,
-            .font: NSFont.systemFont(ofSize: kind == .primary ? 14 : 13, weight: kind == .primary ? .semibold : .medium)
-        ])
+        if isHighlighted && isEnabled {
+            NSColor(white: kind == .ghost || (kind == .segment && !isOn) ? 1 : 0, alpha: 0.14).setFill()
+            path.fill()
+        }
+        let str = NSAttributedString(string: title, attributes: [.foregroundColor: fg, .font: labelFont])
+        let size = str.size()
+        str.draw(at: NSPoint(x: (r.width - size.width) / 2, y: (r.height - size.height) / 2))
     }
+
     override var intrinsicContentSize: NSSize {
-        let w = ceil(attributedTitle.size().width)
+        let w = ceil(NSAttributedString(string: title, attributes: [.font: labelFont]).size().width)
         switch kind {
-        case .primary: return NSSize(width: max(w + 44, 150), height: 40)
-        case .secondary: return NSSize(width: w + 28, height: 30)
-        case .ghost: return NSSize(width: w + 12, height: 24)
+        case .primary: return NSSize(width: max(w + 48, 160), height: 42)
+        case .secondary: return NSSize(width: w + 30, height: 32)
+        case .ghost: return NSSize(width: w + 16, height: 26)
+        case .segment: return NSSize(width: 112, height: 34)
         }
     }
 }
 
 final class Segment: NSView {
     var onChange: ((Int) -> Void)?
-    private var buttons: [NSButton] = []
+    private var buttons: [FlatButton] = []
     var selected = 0 { didSet { restyle() } }
     var isEnabled = true { didSet { buttons.forEach { $0.isEnabled = isEnabled } } }
 
     init(titles: [String]) {
         super.init(frame: .zero)
-        wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
         for (i, t) in titles.enumerated() {
-            let b = NSButton(title: t, target: self, action: #selector(tap(_:)))
+            let b = FlatButton(t, kind: .segment, target: self, action: #selector(tap(_:)))
             b.tag = i
-            b.isBordered = false
-            b.wantsLayer = true
-            b.focusRingType = .none
-            b.setButtonType(.momentaryChange)
-            b.translatesAutoresizingMaskIntoConstraints = false
-            b.widthAnchor.constraint(equalToConstant: 104).isActive = true
-            b.heightAnchor.constraint(equalToConstant: 32).isActive = true
             buttons.append(b)
             stack.addArrangedSubview(b)
         }
@@ -203,26 +226,17 @@ final class Segment: NSView {
         restyle()
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); restyle() }
 
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.panel.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 12, yRadius: 12).fill()
+    }
     @objc func tap(_ s: NSButton) {
         guard s.tag != selected else { return }
         selected = s.tag
         onChange?(selected)
     }
-    func restyle() {
-        layer?.backgroundColor = Theme.panel.cgColor
-        layer?.cornerRadius = 12
-        for b in buttons {
-            let on = b.tag == selected
-            b.layer?.cornerRadius = 9
-            b.layer?.backgroundColor = (on ? Theme.accent : NSColor.clear).cgColor
-            b.attributedTitle = NSAttributedString(string: b.title, attributes: [
-                .foregroundColor: on ? Theme.onAccent : Theme.dim,
-                .font: NSFont.systemFont(ofSize: 13.5, weight: on ? .semibold : .medium)
-            ])
-        }
-    }
+    func restyle() { for b in buttons { b.isOn = b.tag == selected } }
 }
 
 final class DropZone: NSView {
@@ -271,11 +285,11 @@ final class DropZone: NSView {
     }
     private func restyle() {
         layer?.cornerRadius = 16
-        layer?.backgroundColor = (hot ? Theme.accent.withAlphaComponent(0.10) : Theme.panel).cgColor
+        layer?.backgroundColor = (hot ? Theme.blue.withAlphaComponent(0.16) : Theme.panel).cgColor
         border.fillColor = nil
         border.lineWidth = 1.5
         border.lineDashPattern = [7, 6]
-        border.strokeColor = (hot ? Theme.accent : NSColor(white: 1, alpha: 0.20)).cgColor
+        border.strokeColor = (hot ? Theme.accent : NSColor(white: 1, alpha: 0.26)).cgColor
     }
     @objc private func chooseTapped() { onChoose?() }
 
@@ -383,14 +397,7 @@ final class FileRow: NSView {
 }
 
 final class IconView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        let r = bounds
-        Theme.panelHi.setFill()
-        NSBezierPath(roundedRect: r, xRadius: r.width * 0.27, yRadius: r.width * 0.27).fill()
-        let c = NSBezierPath(ovalIn: r.insetBy(dx: r.width * 0.25, dy: r.width * 0.25))
-        NSGradient(colors: [NSColor.white, Theme.accent, NSColor(srgbRed: 0.86, green: 0.34, blue: 0.14, alpha: 1)])?
-            .draw(in: c, angle: -50)
-    }
+    override func draw(_ dirtyRect: NSRect) { drawLogo(in: bounds) }
 }
 
 final class Badge: NSView {
@@ -413,7 +420,7 @@ final class Badge: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         layer?.cornerRadius = 12
-        layer?.backgroundColor = Theme.accent.withAlphaComponent(0.13).cgColor
+        layer?.backgroundColor = Theme.accent.withAlphaComponent(0.15).cgColor
     }
 }
 
@@ -528,7 +535,7 @@ final class MainController: NSObject, NSApplicationDelegate {
             s.action = #selector(sliderMoved)
             s.translatesAutoresizingMaskIntoConstraints = false
             s.widthAnchor.constraint(equalToConstant: 200).isActive = true
-            s.trackFillColor = Theme.accent
+            s.trackFillColor = NSColor(srgbRed: 0.42, green: 0.45, blue: 1.0, alpha: 1)
         }
         formatPopup.addItems(withTitles: ["Dolby Vision 8.1 · 10 bits", "HDR10 · 10 bits"])
         formatPopup.translatesAutoresizingMaskIntoConstraints = false
