@@ -34,7 +34,7 @@ svg { width: 1.2em; height: 1.2em; fill: none; stroke: currentColor; stroke-widt
 .eyebrow { display: flex; gap: 10px; align-items: center; font: 650 11px/1.5 var(--mono); letter-spacing: .16em; color: var(--violet); margin: 0 0 17px; }
 .signal { width: 8px; height: 8px; background: #ccafff; border-radius: 50%; box-shadow: 0 0 12px #c1a0fa8a; margin-right: 3px; }
 h1, h2, h3, p { margin: 0; }
-h1 { font-size: clamp(57px, 6.5vw, 98px); font-weight: 760; line-height: .96; letter-spacing: -.08em; }
+h1 { font-size: clamp(57px, 6.5vw, 98px); font-weight: 760; line-height: .96; letter-spacing: -.064em; word-spacing: .065em; }
 h1 em { font-style: normal; color: #d2b6fc; background: linear-gradient(107deg, #e7d1ff 4%, #a88bea 92%); background-clip: text; -webkit-text-fill-color: transparent; }
 .lead { font-size: clamp(16px, 1.7vw, 20px); line-height: 1.59; color: var(--muted); margin-top: 24px; max-width: 370px; }
 .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 15px 19px; margin-top: 29px; }
