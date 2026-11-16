@@ -1,50 +1,68 @@
 # HDR Studio
 
-Application macOS pour transformer des photos SDR en photos HDR (gain map Apple)
-et des vidéos en Dolby Vision 10 bits (profil 8.1). Fenetre a deux onglets,
-glisser-deposer, traitement en lot.
+Application macOS qui exporte tes photos en **HEIC HDR (gain map)** et tes vidéos en
+**HEVC 10 bits Dolby Vision 8.1** ou **HDR10**. Tout est traité sur le Mac.
 
-## Installation (terminal)
+![Onglet Vidéo](docs/capture-video.jpg)
 
-```bash
-git clone https://github.com/renaud-bxl/hdr-studio.git -b claude
-cd hdr-studio
-./install.sh
+## Installation
+
+```sh
+git clone -b claude https://github.com/renaud-bxl/hdr-studio.git
+cd hdr-studio && ./install.sh
 ```
 
-Le script installe au besoin ffmpeg, dovi_tool et gpac (via Homebrew), compile
-l'application et la depose sur le Bureau.
+Le script installe au besoin `ffmpeg`, `dovi_tool` et `gpac` avec Homebrew, compile
+l'application et dépose « HDR Studio Claude.app » sur le Bureau.
 
-Prerequis : Mac Apple Silicon, macOS 14+, Homebrew, outils Xcode
+Prérequis : macOS 14 ou plus récent, [Homebrew](https://brew.sh), outils Xcode
 (`xcode-select --install`).
+
+La page de présentation est dans [`docs/index.html`](docs/index.html). Elle peut être
+servie par GitHub Pages (dossier `/docs`) ou déposée telle quelle sur un hébergement web.
 
 ## Utilisation
 
-- Onglet **Photo** : glisse tes photos, choisis le dossier d'export, clique
-  « Exporter en HDR ». Les fichiers `_HDR.heic` sont crees dans le dossier choisi.
-- Onglet **Video** : glisse tes videos, choisis le dossier d'export, clique
-  « Exporter en Dolby Vision ». Les fichiers `_DV.mp4` sont crees dans le dossier.
+1. Choisis l'onglet **Photo** ou **Vidéo**.
+2. Dépose tes fichiers, ou clique sur **Choisir des fichiers…**
+3. Règle l'intensité et, pour la vidéo, le format.
+4. Clique sur **Traiter** et choisis le dossier d'export.
 
-En ligne de commande :
+Les originaux ne sont jamais modifiés. Si un export du même nom existe, le nouveau reçoit un numéro.
 
-```bash
-~/.local/bin/hdrphoto photo1.jpg photo2.jpg
-~/.local/bin/hdrvideo.sh video.mp4 /dossier/sortie
+## Formats
+
+| Export | Fichier | Contenu |
+|---|---|---|
+| Photo HDR | `nom_HDR.heic` | Base Display P3 et gain map ISO 21496-1 |
+| Dolby Vision | `nom_DV.mp4` | HEVC Main 10, BT.2020 PQ, HDR10, RPU Dolby Vision 8.1 |
+| HDR10 | `nom_HDR10.mp4` | HEVC Main 10, BT.2020 PQ, HDR10 |
+
+Rendu :
+
+- **Photo** : en lumière linéaire, chaque canal suit `r + k·r³` avec `k = 2^stops − 1`.
+  Les ombres et tons moyens restent en place, le blanc monte de la valeur du curseur.
+- **Vidéo SDR** : linéarisation, passage BT.709 vers BT.2020, blanc de référence à 203 nits,
+  puis rehaussement progressif jusqu'à `203 × 2^stops` nits (environ 810 nits à +2 stops).
+- **Vidéo HLG** (iPhone) : conversion vers PQ pour un écran de 1000 nits.
+- **Vidéo PQ** : le signal est conservé.
+
+## Ligne de commande et vérifications
+
+```sh
+APP="$HOME/Desktop/HDR Studio Claude.app/Contents/MacOS/HDRStudio"
+"$APP" --convert-photo photo.jpg photo_HDR.heic 1.3
+"$APP" --convert-video video.mov video_DV.mp4 dv 2.0     # ou hdr10
+
+swiftc -O Scripts/probe-photo.swift -o probe && ./probe photo.jpg photo_HDR.heic
+MP4Box -info video_DV.mp4 | grep -i dolby
 ```
 
-## A savoir (honnete)
+## À savoir
 
-- Partir d'une source SDR donne une **mise en valeur** HDR, pas une recuperation
-  de details perdus dans les hautes lumieres.
-- Pour une **distribution publique** de l'app :
-  - il faut un compte **Apple Developer** (99 $/an) pour signer et notariser,
-    sinon macOS bloque l'ouverture ;
-  - « Dolby Vision » est une marque et un format proprietaires ; diffuser un
-    produit public qui en porte le nom releve en principe d'une licence Dolby.
-    Sans licence, privilegier l'angle « HDR / HLG 10 bits ».
-
-## Technique
-
-- Photo : Core Image, gain map ISO 21496-1, sortie HEIC Display P3.
-- Video : x265 (base HDR10 PQ 10 bits) + dovi_tool (RPU 8.1) + MP4Box
-  (signalisation dvcC).
+- Une source SDR reste une source SDR : l'application rehausse les hautes lumières, elle ne
+  recrée pas les détails perdus à la prise de vue.
+- L'encodage vidéo (x265, 10 bits) est lent sur de la 4K.
+- L'application est signée pour un usage local. Une diffusion publique demande un compte
+  Apple Developer (signature et notarisation). Dolby Vision est une marque et un format de
+  Dolby Laboratories ; son usage dans un produit diffusé peut demander un accord de licence.

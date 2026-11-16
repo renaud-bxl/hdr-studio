@@ -528,9 +528,12 @@ final class MainController: NSObject, NSApplicationDelegate {
             s.action = #selector(sliderMoved)
             s.translatesAutoresizingMaskIntoConstraints = false
             s.widthAnchor.constraint(equalToConstant: 200).isActive = true
+            s.trackFillColor = Theme.accent
         }
         formatPopup.addItems(withTitles: ["Dolby Vision 8.1 · 10 bits", "HDR10 · 10 bits"])
         formatPopup.translatesAutoresizingMaskIntoConstraints = false
+        formatPopup.target = self
+        formatPopup.action = #selector(formatChanged)
         photoOpts = NSStackView(views: [makeLabel("Intensité des hautes lumières", size: 12.5, color: Theme.dim), photoSlider, photoValue])
         videoOpts = NSStackView(views: [makeLabel("Format", size: 12.5, color: Theme.dim), formatPopup,
                                         makeLabel("Intensité", size: 12.5, color: Theme.dim), videoSlider, videoValue])
@@ -591,7 +594,7 @@ final class MainController: NSObject, NSApplicationDelegate {
             drop.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: m),
             drop.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -m),
             drop.topAnchor.constraint(equalTo: segment.bottomAnchor, constant: 16),
-            drop.heightAnchor.constraint(equalToConstant: 178),
+            drop.heightAnchor.constraint(equalToConstant: 158),
 
             photoOpts.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: m),
             photoOpts.topAnchor.constraint(equalTo: drop.bottomAnchor, constant: 16),
@@ -637,7 +640,8 @@ final class MainController: NSObject, NSApplicationDelegate {
 
     func refreshAll() {
         let photo = mode == 0
-        badge.text = photo ? "HEIC · GAIN MAP HDR" : "HEVC 10 BITS · DOLBY VISION"
+        let dolby = formatPopup.indexOfSelectedItem == 0
+        badge.text = photo ? "HEIC · GAIN MAP HDR" : (dolby ? "HEVC 10 BITS · DOLBY VISION" : "HEVC 10 BITS · HDR10")
         drop.title.stringValue = photo ? "Dépose tes photos ici" : "Dépose tes vidéos ici"
         drop.sub.stringValue = photo ? "JPEG, PNG, HEIC, TIFF et autres images" : "MOV, MP4, MKV et autres vidéos"
         photoOpts.isHidden = !photo
@@ -662,8 +666,8 @@ final class MainController: NSObject, NSApplicationDelegate {
         let list = items[mode]
         let pending = list.filter { $0.state == .waiting || $0.state == .failed }.count
         let done = list.filter { $0.state == .done }.count
-        var head = "FICHIERS  \(list.count)"
-        if done > 0 { head += "   ·   \(done) TERMINÉ" + (done > 1 ? "S" : "") }
+        var head = "FICHIERS \(list.count)"
+        if done > 0 { head += " · \(done) TERMINÉ" + (done > 1 ? "S" : "") }
         listTitle.attributedStringValue = spacedCaps(head)
         clearButton.isHidden = list.isEmpty || running
         emptyLabel.isHidden = !list.isEmpty
@@ -693,6 +697,8 @@ final class MainController: NSObject, NSApplicationDelegate {
     }
 
     // MARK: Actions
+
+    @objc func formatChanged() { refreshAll() }
 
     @objc func sliderMoved() {
         photoValue.stringValue = String(format: "+%.1f stop", photoSlider.doubleValue)
